@@ -24,9 +24,9 @@ jobs:
           git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks
           mkdir -p $HOME/theos/sdks
           cp -R $HOME/sdks/iPhoneOS16.5.sdk $HOME/theos/sdks/
-          ls $HOME/theos/sdks
+          ls -la $HOME/theos/sdks
 
-      - name: Build tweak
+      - name: Build tweaks
         run: |
           cd $GITHUB_WORKSPACE
           make clean || true
@@ -36,8 +36,8 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p $GITHUB_WORKSPACE/out
-          # release 构建：唯一产物在 .theos/obj/kugou_noad_v9i.dylib
-          cp .theos/obj/kugou_noad_v9i.dylib $GITHUB_WORKSPACE/out/
+          cp .theos/obj/kugou_noad_v9i.dylib $GITHUB_WORKSPACE/out/ || true
+          cp .theos/obj/kgvipaward.dylib $GITHUB_WORKSPACE/out/ || true
           ls -la $GITHUB_WORKSPACE/out
 
       - name: Upload artifact
