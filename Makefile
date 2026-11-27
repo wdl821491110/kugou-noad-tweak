@@ -8,7 +8,7 @@ TWEAK_NAME = kugou_noad_v9i kgvipaward
 kugou_noad_v9i_FILES = src/Tweak.xm
 kugou_noad_v9i_CFLAGS = -fobjc-arc
 
-kgvipaward_FILES = src/VipAward.xm
+kgvipaward_FILES = src/VipAward.x
 kgvipaward_CFLAGS = -fobjc-arc
 
 include $(THEOS_MAKE_PATH)/tweak.mk
