@@ -14,8 +14,9 @@
  *    真实显示方法；避开带 complete block 的方法防止回调不触发卡流程。
  *  - v6-D：精简臃肿功能入口（直播/K歌/游戏/商城），只拦纯跳转方法，
  *    不隐藏 view（防依赖崩溃）、不碰内购（防 VIP 买不了）、不碰带 block 的。
- *  - v7：我的页赚钱（任务中心）+ 首页轮播图。轮播图连数据源一起拦，
- *    数据源用空数组而非 nil，避免下游遍历崩溃。
+ *  - v7：我的页赚钱（任务中心）+ 首页轮播图 + 首页运营卡片位
+ *    （概念实验室/盲盒/VIP推荐/小众宝藏等）。数据源用空数组而非 nil 防崩；
+ *    不碰首页推荐主接口 requestRecSortFirstPageData，保住正常歌曲流。
  */
 
 @import Foundation;
@@ -43,7 +44,6 @@ static id KGNoopNil(id self, SEL _cmd, ...) { return nil; }
 
 /* 返回空容器：比 nil 安全，避免下游直接遍历/取 count 崩溃 */
 static id KGNoopEmptyArray(id self, SEL _cmd, ...) { return @[]; }
-static id KGNoopEmptyDict(id self, SEL _cmd, ...) { return @{}; }
 
 /* 需要给回调传 nil，否则业务流程卡住 */
 static void KGNoop_CB2(id self, SEL _cmd, id success, id error) { KGCallCB(success); }
@@ -229,6 +229,19 @@ static KGSelHook kSelHooks[] = {
     {"showBannerByDiffCategory", (IMP)KGNoopNil},
     {"setupSliderBannerAdSubviews:", (IMP)KGNoopNil},
     {"refreshRecommendBannerFromRequestResponse:", (IMP)KGNoopNil},
+
+    /* v7b: 首页运营卡片位数据源（概念实验室/盲盒/VIP推荐/小众宝藏等）。
+     * 这些卡片由 discovery / home banner 信息接口下发，拦数据源返回空数组。
+     * 注意：不碰 requestRecSortFirstPageData（首页推荐主接口），保住正常歌曲流。 */
+    {"requestDiscoveryBannerInfo", (IMP)KGNoopNil},
+    {"requestNewDiscoveryBannerInfo", (IMP)KGNoopNil},
+    {"getDiscoveryBannerInfoWithError:", (IMP)KGNoopEmptyArray},
+    {"getHomeADBannarListWithError:", (IMP)KGNoopEmptyArray},
+    {"getHomeADBannarListWithWithRepCallBack:exceptionCallBack:", (IMP)KGNoopNil},
+    {"getCardHomeBannerInfoWithError:", (IMP)KGNoopEmptyArray},
+    {"requestBannerBackupForHomeWithError:", (IMP)KGNoopNil},
+    {"requestBannerBackupForHomeWithSuccessBlock:failBlock:", (IMP)KGNoopNil},
+    {"requestHomeTextAd", (IMP)KGNoopNil},
 };
 static const NSUInteger kSelHookCount = sizeof(kSelHooks) / sizeof(kSelHooks[0]);
 
