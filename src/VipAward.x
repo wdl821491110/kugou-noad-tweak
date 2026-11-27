@@ -271,7 +271,8 @@ static void KGAutoClaim(void) {
     if (KGClaimDone) { return; }
     KGLoadCreds();
     @synchronized (KGCreds) {
-        if (KGCreds[@"token"].length == 0 || KGCreds[@"userid"].length == 0) { return; }
+        NSString *tok = KGCreds[@"token"], *uid = KGCreds[@"userid"];
+        if (tok.length == 0 || uid.length == 0) { return; }
     }
     KGClaimDone = YES;
     KGDoSignIn();
