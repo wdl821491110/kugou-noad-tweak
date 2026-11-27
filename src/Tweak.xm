@@ -142,7 +142,7 @@ static KGSelHook kSelHooks[] = {
     {"checkShowCalendarSignInAlertWithFirstPlay", (IMP)KGNoopNil},
 
     /* v5-B: 引导浮层（GuideView）真实显示方法。
-     * 只挑 show*/p_show* 这类真正绘制的方法；避开带 complete:/endShow block 的
+     * 只挑 show 与 p_show 开头这类真正绘制的方法；避开带 complete/endShow block 的
      * （拦了不调 block 会让流程卡住）。中风险：首次用某功能会没提示，但功能本身可用。 */
     {"showGuide", (IMP)KGNoopNil},
     {"showGuideView", (IMP)KGNoopNil},
