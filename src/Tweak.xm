@@ -27,10 +27,11 @@
  *  - v9：v8 仍漏两张卡且隐藏后留大片空白，修正方向：
  *     * 识别：按 cell 内 UILabel / accessibilityLabel 文字命中标题关键词，
  *       不再只靠类名（「喜欢 X 的 TA 也喜欢」「概念er新推」的类名猜错）。
- *     * 高度：记录命中的 collectionView / indexPath，hook sizeForItem 与
- *       heightForRow 返回 0，并 invalidateLayout，空白随卡片一起消失。
  *     * 重试：cell 类可能在用户首次进发现页才注册，加 1 秒 × 180 次重试。
  *     * 赚钱：补拦 taskCenterButtonClick / p_btnTaskCenterAction 等真实点击。
+ *  - v9b：v9 启动黑屏后闪退，判定是 sizeForItem / heightForRow /
+ *     preferredLayoutAttributesFittingAttributes 归零导致布局反复重算。
+ *     v9b 回退全部高度归零，只保留按文字隐藏 + 真实点击拦截，先保启动稳定。
  */
 
 @import Foundation;
@@ -53,14 +54,12 @@ typedef void (^KGSuccessCB)(id);
  * 2) 记录命中关键词的 indexPath，供 sizeForItem / heightForRow 归零；
  * 3) 按 cell 内文字识别，避免类名猜错。 */
 static NSMutableDictionary *KGOriginalIMPs = nil;
-static NSMutableSet *KGHiddenPaths = nil;
 static NSArray *KGHideKeywords = nil;
 
 static void KGInitRuntimeState(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         KGOriginalIMPs = [NSMutableDictionary dictionary];
-        KGHiddenPaths = [NSMutableSet set];
         KGHideKeywords = @[
             @"TA也喜欢", @"ta也喜欢", @"TA特喜欢", @"ta特喜欢",
             @"概念er新推", @"概念实验室", @"曲风盲盒", @"VIP专属", @"小众宝藏",
@@ -117,38 +116,11 @@ static void KGHideView(UIView *view) {
     if (view.alpha != 0.0) { view.alpha = 0.0; }
 }
 
-static NSString *KGPathKey(id container, NSInteger section, NSInteger index) {
-    return [NSString stringWithFormat:@"%p-%ld-%ld", (__bridge void *)container, (long)section, (long)index];
-}
-
-static BOOL KGIsHiddenPath(id container, NSInteger section, NSInteger index) {
-    KGInitRuntimeState();
-    return [KGHiddenPaths containsObject:KGPathKey(container, section, index)];
-}
-
-static BOOL KGMarkHiddenPath(id container, NSInteger section, NSInteger index) {
-    KGInitRuntimeState();
-    NSString *key = KGPathKey(container, section, index);
-    if ([KGHiddenPaths containsObject:key]) { return NO; }
-    [KGHiddenPaths addObject:key];
-    return YES;
-}
-
 /* ============ v8/v9: 首页运营卡片 + 任务入口 view 运行时隐藏 ============
- * v8：按类名 hook layoutSubviews 让 cell 自身隐藏。
- * v9：额外 hook preferredLayoutAttributesFittingAttributes: 返回 zero size，
- *     只改本类方法，绝不碰父类，避免误伤普通歌曲 cell。 */
+ * 按类名 hook layoutSubviews 让 cell 自身隐藏；只改本类方法，
+ * 绝不碰父类，避免误伤普通歌曲 cell。 */
 static void KGHiddenLayout(id self, SEL _cmd) {
     KGHideView((UIView *)self);
-}
-
-static UICollectionViewLayoutAttributes *KGHiddenFitting(id self, SEL _cmd, UICollectionViewLayoutAttributes *attributes) {
-    UICollectionViewLayoutAttributes *result = [attributes copy];
-    if (!result) { result = [UICollectionViewLayoutAttributes new]; }
-    result.size = CGSizeZero;
-    result.hidden = YES;
-    result.alpha = 0.0;
-    return result;
 }
 
 /* 只给「本类」安装方法：绝不用 class_getInstanceMethod（会沿继承链拿到父类实现） */
@@ -202,18 +174,15 @@ static void KGInstallCardCellHooks(void) {
     };
     static BOOL installed[32] = { NO };
     SEL layoutSel = @selector(layoutSubviews);
-    SEL fittingSel = @selector(preferredLayoutAttributesFittingAttributes:);
 
     for (int i = 0; names[i] && i < 32; i++) {
         if (installed[i]) { continue; }
         Class cls = objc_getClass(names[i]);
         if (!cls) { continue; }   // 类还没注册，下一秒再试
 
-        BOOL a = KGInstallOwnMethod(cls, layoutSel, (IMP)KGHiddenLayout, "v@:");
-        BOOL b = KGInstallOwnMethod(cls, fittingSel, (IMP)KGHiddenFitting, "@:@");
-        if (a || b) {
+        if (KGInstallOwnMethod(cls, layoutSel, (IMP)KGHiddenLayout, "v@:")) {
             installed[i] = YES;
-            KGLogAlways(@"hidden hooks installed: %s", names[i]);
+            KGLogAlways(@"hidden hook installed: %s", names[i]);
         } else {
             KGLogAlways(@"cannot hook: %s", names[i]);
         }
@@ -260,12 +229,11 @@ static void KGNoop_CB3Bool(id self, SEL _cmd, BOOL a, id success, id error) { KG
 static void KGNoop_CB4Bool(id self, SEL _cmd, BOOL a, id b, id success, id error) { KGCallCB(success); }
 static void KGNoop_CB4Id(id self, SEL _cmd, id a, id b, id success, id error) { KGCallCB(success); }
 
-/* ============ v9: 按文字隐藏 + 高度归零（保留原实现） ============
+/* ============ v9/v9b: 按文字隐藏（保留原实现，不改高度） ============
  * 这些 hook 不能置空原实现：先调用 original，再按 cell 内文字判断。
- * 原始 IMP 在 KGInstallSelectorHooks 替换前存进 KGOriginalIMPs。 */
-typedef CGSize (*KGSizeIMP)(id, SEL, id, id, id);
-typedef CGFloat (*KGHeightIMP)(id, SEL, id, id);
-
+ * 原始 IMP 在 KGInstallSelectorHooks 替换前存进 KGOriginalIMPs。
+ * v9b：不再 invalidateLayout / reloadData，也不改 size/height，
+ * 避免 UICollectionView 反复重算导致启动黑屏后闪退。 */
 static IMP KGCurrentOriginalIMP(id self, SEL sel) {
     return KGOriginalIMP(class_getInstanceMethod(object_getClass(self), sel));
 }
@@ -274,34 +242,22 @@ static void KGWillDisplayCollectionCell(id self, SEL _cmd, UICollectionView *col
                                         UICollectionViewCell *cell, NSIndexPath *indexPath) {
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, collectionView, cell, indexPath); }
-    if (!KGViewTextMatches(cell, 0)) { return; }
-
-    KGHideView(cell);
-    NSInteger index = indexPath.item;
-    BOOL fresh = KGMarkHiddenPath(collectionView, indexPath.section, index);
-    if (fresh) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [collectionView.collectionViewLayout invalidateLayout];
-        });
+    if (KGViewTextMatches(cell, 0)) {
+        KGHideView(cell);
+        KGLogAlways(@"hidden collection cell by text: %ld-%ld",
+                    (long)indexPath.section, (long)indexPath.item);
     }
-    KGLogAlways(@"hidden collection cell by text: %ld-%ld", (long)indexPath.section, (long)index);
 }
 
 static void KGWillDisplayTableCell(id self, SEL _cmd, UITableView *tableView,
                                    UITableViewCell *cell, NSIndexPath *indexPath) {
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, tableView, cell, indexPath); }
-    if (!KGViewTextMatches(cell, 0)) { return; }
-
-    KGHideView(cell);
-    NSInteger index = indexPath.row;
-    BOOL fresh = KGMarkHiddenPath(tableView, indexPath.section, index);
-    if (fresh) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [tableView reloadData];
-        });
+    if (KGViewTextMatches(cell, 0)) {
+        KGHideView(cell);
+        KGLogAlways(@"hidden table cell by text: %ld-%ld",
+                    (long)indexPath.section, (long)indexPath.row);
     }
-    KGLogAlways(@"hidden table cell by text: %ld-%ld", (long)indexPath.section, (long)index);
 }
 
 static void KGWillDisplaySupplementary(id self, SEL _cmd, UICollectionView *collectionView,
@@ -316,23 +272,6 @@ static void KGWillDisplayTableHeader(id self, SEL _cmd, UITableView *tableView,
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, NSInteger))original)(self, _cmd, tableView, view, section); }
     if (KGViewTextMatches(view, 0)) { KGHideView(view); }
-}
-
-static CGSize KGSizeForItem(id self, SEL _cmd, UICollectionView *collectionView,
-                            UICollectionViewLayout *layout, NSIndexPath *indexPath) {
-    NSInteger index = indexPath.item;
-    if (KGIsHiddenPath(collectionView, indexPath.section, index)) { return CGSizeZero; }
-    IMP original = KGCurrentOriginalIMP(self, _cmd);
-    if (original) { return ((KGSizeIMP)original)(self, _cmd, collectionView, layout, indexPath); }
-    return CGSizeMake(1.0, 1.0);
-}
-
-static CGFloat KGHeightForRow(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
-    NSInteger index = indexPath.row;
-    if (KGIsHiddenPath(tableView, indexPath.section, index)) { return 0.0; }
-    IMP original = KGCurrentOriginalIMP(self, _cmd);
-    if (original) { return ((KGHeightIMP)original)(self, _cmd, tableView, indexPath); }
-    return 0.0;
 }
 
 /* ============ hook 注册表 ============ */
@@ -559,9 +498,6 @@ static KGSelHook kPreserveSelHooks[] = {
     {"collectionView:willDisplaySupplementaryView:forElementKind:atIndexPath:", (IMP)KGWillDisplaySupplementary},
     {"tableView:willDisplayHeaderView:forSection:", (IMP)KGWillDisplayTableHeader},
     {"tableView:willDisplayFooterView:forSection:", (IMP)KGWillDisplayTableHeader},
-    {"collectionView:layout:sizeForItemAtIndexPath:", (IMP)KGSizeForItem},
-    {"tableView:heightForRowAtIndexPath:", (IMP)KGHeightForRow},
-    {"tableView:estimatedHeightForRowAtIndexPath:", (IMP)KGHeightForRow},
 };
 static const NSUInteger kPreserveSelHookCount = sizeof(kPreserveSelHooks) / sizeof(kPreserveSelHooks[0]);
 
