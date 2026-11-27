@@ -10,7 +10,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 
-#define KG_VER   @"v16c"
+#define KG_VER   @"v17"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"
@@ -341,7 +341,8 @@ static void KGLoadCreds(void) {
 }
 
 // ---------- 弹窗 ----------
-static void KGVipAlert(NSString *msg) {
+// v17：统一弹窗。buttons 为空时只给一个「好」；多个按钮时第 0 个用 Cancel 样式。
+static void KGVipAlertEx(NSString *msg, NSArray *buttons, void (^handler)(NSInteger idx)) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *root = nil;
         for (__kindof UIWindowScene *sc in [UIApplication sharedApplication].connectedScenes) {
@@ -355,12 +356,26 @@ static void KGVipAlert(NSString *msg) {
         }
         if (!root) { return; }
         while (root.presentedViewController) { root = root.presentedViewController; }
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"KGVipAward"
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"KGVipAward %@", KG_VER]
                                                                     message:msg
                                                              preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        NSArray *bs = (buttons.count > 0) ? buttons : @[@"好"];
+        for (NSUInteger i = 0; i < bs.count; i++) {
+            UIAlertActionStyle st = (bs.count > 1 && i == 0) ? UIAlertActionStyleCancel : UIAlertActionStyleDefault;
+            [ac addAction:[UIAlertAction actionWithTitle:KGStr(bs[i]) style:st handler:^(__unused UIAlertAction *a) {
+                if (handler) { handler((NSInteger)i); }
+            }]];
+        }
         [root presentViewController:ac animated:YES completion:nil];
     });
+}
+
+static void KGVipAlert(NSString *msg) { KGVipAlertEx(msg, nil, nil); }
+
+// 上一个弹窗刚关闭时立刻 present 会失败，统一延后 0.35 秒
+static void KGAlertThen(void (^block)(void)) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ if (block) { block(); } });
 }
 
 static NSString *KGVDesc(id v) {
@@ -736,45 +751,12 @@ static void KGReplayPost(NSString *path, void (^done)(NSDictionary *json, NSErro
 
 static void KGPost(NSString *path, NSMutableDictionary *params,
                    void (^done)(NSDictionary *json, NSError *err)) {
-    // v16：只要抓到 App 已签名请求，就整段复用，绝不自己算签名
+    // v17：只走「复用 App 已签名 query」。本地签名（3116 口径）已被证明必然 51002，
+    // 留着只会污染 diag、并让一次性保护误判成「已答复」，故彻底去掉兜底。
+    (void)params;
     if (KGReplayReady()) { KGReplayPost(path, done); return; }
-    params[@"dfid"] = KGCurDfid();
-    params[@"uuid"] = @"-";
-    params[@"mid"] = KGCurMid();
-    params[@"appid"] = KG_APPID;
-    params[@"clientver"] = KG_CLIENTVER;
-    NSString *ct = [NSString stringWithFormat:@"%d", (int)[NSDate date].timeIntervalSince1970];
-    params[@"clienttime"] = ct;
-    params[@"signature"] = KGSign(params);
-
-    NSMutableArray *qs = [NSMutableArray array];
-    for (NSString *k in params) {
-        [qs addObject:[NSString stringWithFormat:@"%@=%@", k, KGEnc([NSString stringWithFormat:@"%@", params[k]])]];
-    }
-    NSString *url = [NSString stringWithFormat:@"https://gateway.kugou.com%@?%@", path, [qs componentsJoinedByString:@"&"]];
-
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
-    objc_setAssociatedObject(req, &kKGOurReqKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    req.HTTPMethod = @"POST";
-    [req setValue:KG_UA forHTTPHeaderField:@"User-Agent"];
-    [req setValue:KGCurDfid() forHTTPHeaderField:@"dfid"];
-    [req setValue:KGCurMid() forHTTPHeaderField:@"mid"];
-    [req setValue:ct forHTTPHeaderField:@"clienttime"];
-    [req setValue:@"1" forHTTPHeaderField:@"kg-rc"];
-    [req setValue:@"5d816a0" forHTTPHeaderField:@"kg-thash"];
-    [req setValue:@"1" forHTTPHeaderField:@"kg-rec"];
-    [req setValue:KG_RF forHTTPHeaderField:@"kg-rf"];
-    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
-    req.timeoutInterval = 15;
-
-    NSURLSession *s = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration];
-    NSURLSessionDataTask *t = [s dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-        if (e || !d) { done(nil, e); return; }
-        id json = nil;
-        @try { json = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil]; } @catch (__unused NSException *ex) {}
-        done([json isKindOfClass:NSDictionary.class] ? json : nil, nil);
-    }];
-    [t resume];
+    done(nil, [NSError errorWithDomain:@"KGReplay" code:-1
+                             userInfo:@{NSLocalizedDescriptionKey: @"等 App 发出已签名请求"}]);
 }
 
 // v16：用 App 已签名的 query 串直接发目标接口（只换 path，参数一字不改）
@@ -967,7 +949,7 @@ static void KGProbeApis(void (^done)(void)) {
         KGProbeQueue(defs, 0, acc, oks, ^{
             running = NO;
             if (oks.count > 0) {
-                KGVipAlert([NSString stringWithFormat:@"%@接口探测命中 %lu 个(见 diag)", KG_VER, (unsigned long)oks.count]);
+                KGWriteDiag([NSString stringWithFormat:@"%@探测命中 %lu 个", KG_VER, (unsigned long)oks.count]);
             }
             if (done) { done(); }
         });
@@ -1145,6 +1127,13 @@ static void KGRunTokenTests(void (^done)(void)) {
 static void KGDoClaim(void);
 static void KGDoUpgrade(void);
 
+// v17 第 2 个弹窗：点「升级」才真正发升级请求
+static void KGPromptUpgrade(void) {
+    KGVipAlertEx(@"是否升级1日VIP？", @[@"取消", @"升级"], ^(NSInteger idx) {
+        if (idx == 1) { KGDoUpgrade(); }
+    });
+}
+
 static void KGDoClaim(void) {
     if (KGDoneToday || KGReceiveDone) { return; }
     static BOOL inflight = NO;
@@ -1163,38 +1152,33 @@ static void KGDoClaim(void) {
     KGPost(@"/youth/v1/recharge/receive_vip_listen_song", p, ^(NSDictionary *json, NSError *err) {
         if (err && [err.domain isEqualToString:@"KGReplay"]) {
             inflight = NO;
-            KGWriteDiag([NSString stringWithFormat:@"v16 领取跳过：%@", err.localizedDescription]);
+            KGWriteDiag([NSString stringWithFormat:@"%@ 领取跳过：%@", KG_VER, err.localizedDescription]);
             return;
         }
-        NSString *msg;
-        if (err) { msg = [NSString stringWithFormat:@"签到网络错误: %@", err.localizedDescription]; }
-        else {
-            NSInteger code = -999;
-            if ([json[@"status"] respondsToSelector:@selector(intValue)]) { code = [json[@"status"] intValue]; }
-            NSString *em = KGStr(json[@"error_code"]);
-            if (code == 1) { msg = @"签到成功"; }
-            else if ([em isEqualToString:@"131001"]) { msg = @"今天已签到"; }
-            else if ([em isEqualToString:@"20028"]) { msg = @"账号风控(20028)"; }
-            else { msg = [NSString stringWithFormat:@"签到失败 code=%@ status=%@ msg=%@", em, KGStr(json[@"status"]), KGStr(json[@"error_msg"])]; }
-        }
-        BOOL kgFail = ([msg hasPrefix:@"签到失败"] || [msg hasPrefix:@"签到网络错误"]);
-        BOOL kgNoop = [msg isEqualToString:@"今天已签到"];
-        if (!err) { KGReceiveDone = YES; }   // 服务端已给业务答复，不再重复发
-        static BOOL kgFailAlerted = NO;
-        if (kgNoop) {
-            // 131001 说明 token 已被服务端接受（否则只会是 51002/20018/20006），方案成立
-            static BOOL kgOkAlerted = NO;
-            if (!kgOkAlerted) {
-                kgOkAlerted = YES;
-                KGVipAlert([NSString stringWithFormat:@"%@：token 有效，今日已领，明天打开自动领", KG_VER]);
-            }
-        } else if (!kgFail || !kgFailAlerted) {
-            if (kgFail) { kgFailAlerted = YES; }
-            KGVipAlert([NSString stringWithFormat:@"自动领(%@)：%@", KG_VER, msg]);
-        }
-        KGWriteDiag(msg);
         inflight = NO;
-        if ([msg hasPrefix:@"签到成功"] || [msg isEqualToString:@"今天已签到"]) { KGDoUpgrade(); }
+        if (err) {
+            KGWriteDiag([NSString stringWithFormat:@"签到网络错误: %@", err.localizedDescription]);
+            return;
+        }
+        NSInteger code = -999;
+        if ([json[@"status"] respondsToSelector:@selector(intValue)]) { code = [json[@"status"] intValue]; }
+        NSString *em = KGStr(json[@"error_code"]);
+        // 鉴权类错误（签名/token）允许下一轮重试，其余业务答复一律只发一次
+        BOOL authErr = [em isEqualToString:@"51002"] || [em isEqualToString:@"20018"] || [em isEqualToString:@"20006"];
+        KGReceiveDone = !authErr;
+        KGWriteDiag([NSString stringWithFormat:@"签到 status=%ld code=%@", (long)code, em.length ? em : @"-"]);
+        if (code == 1) {
+            // 弹窗一：畅听领取成功 → 点「好」后弹窗二
+            KGAlertThen(^{
+                KGVipAlertEx(@"获取1日畅听成功", @[@"好"], ^(NSInteger idx) {
+                    (void)idx;
+                    KGAlertThen(^{ KGPromptUpgrade(); });
+                });
+            });
+        } else if ([em isEqualToString:@"131001"]) {
+            // 弹窗三：当日已获取
+            KGAlertThen(^{ KGVipAlert(@"今日已获取"); });
+        }
     });
 }
 
@@ -1208,30 +1192,28 @@ static void KGDoUpgrade(void) {
     if (token.length > 0) { p[@"token"] = token; p[@"userid"] = userid; }
     KGPost(@"/youth/v1/listen_song/upgrade_vip_reward", p, ^(NSDictionary *json, NSError *err) {
         if (err && [err.domain isEqualToString:@"KGReplay"]) {
-            KGWriteDiag([NSString stringWithFormat:@"v16 升级跳过：%@", err.localizedDescription]);
+            KGWriteDiag([NSString stringWithFormat:@"%@ 升级跳过：%@", KG_VER, err.localizedDescription]);
             return;
         }
-        NSString *msg;
-        if (err) { msg = [NSString stringWithFormat:@"升级网络错误: %@", err.localizedDescription]; }
-        else {
-            NSInteger code = -999;
-            if ([json[@"status"] respondsToSelector:@selector(intValue)]) { code = [json[@"status"] intValue]; }
-            NSString *em = KGStr(json[@"error_code"]);
-            if (code == 1) { msg = @"升级成功，已领概念版 VIP 1 天"; KGDoneToday = YES; }
-            else if ([em isEqualToString:@"131001"]) { msg = @"今天已签到"; KGDoneToday = YES; }
-            else if ([em isEqualToString:@"297002"]) { msg = @"今天已升级"; KGDoneToday = YES; }
-            else if ([em isEqualToString:@"20028"]) { msg = @"账号风控(20028)"; }
-            else { msg = [NSString stringWithFormat:@"升级失败 code=%@ status=%@ msg=%@", em, KGStr(json[@"status"]), KGStr(json[@"error_msg"])]; }
+        if (err) {
+            KGWriteDiag([NSString stringWithFormat:@"升级网络错误: %@", err.localizedDescription]);
+            return;
         }
-        BOOL kgFail = ([msg hasPrefix:@"升级失败"] || [msg hasPrefix:@"升级网络错误"]);
-        BOOL kgNoop = ([msg isEqualToString:@"今天已签到"] || [msg isEqualToString:@"今天已升级"]);
-        if (!err) { KGUpgradeDone = YES; }
-        static BOOL kgUpFailAlerted = NO;
-        if (!kgNoop && (!kgFail || !kgUpFailAlerted)) {
-            if (kgFail) { kgUpFailAlerted = YES; }
-            KGVipAlert([NSString stringWithFormat:@"自动领(%@)：%@", KG_VER, msg]);
+        KGUpgradeDone = YES;
+        NSInteger code = -999;
+        if ([json[@"status"] respondsToSelector:@selector(intValue)]) { code = [json[@"status"] intValue]; }
+        NSString *em = KGStr(json[@"error_code"]);
+        if ([em isEqualToString:@"51002"] || [em isEqualToString:@"20018"] || [em isEqualToString:@"20006"]) {
+            KGUpgradeDone = NO;
         }
-        KGWriteDiag(msg);
+        KGWriteDiag([NSString stringWithFormat:@"升级 status=%ld code=%@", (long)code, em.length ? em : @"-"]);
+        if (code == 1) {
+            KGDoneToday = YES;
+            KGAlertThen(^{ KGVipAlert(@"获取1日VIP成功"); });
+        } else if ([em isEqualToString:@"131001"] || [em isEqualToString:@"297002"]) {
+            KGDoneToday = YES;
+            KGAlertThen(^{ KGVipAlert(@"今日已获取"); });
+        }
     });
 }
 
@@ -1292,12 +1274,9 @@ static void KGAutoClaimTick(BOOL verbose) {
     if (token.length > 0 && userid.length > 0) {
         KGDoClaim();
     } else if (verbose) {
-        KGWriteDiag(@"diag-tick");
-        KGVipAlert([NSString stringWithFormat:
-            @"%@诊断: 缺凭据\n挂载 登录:%@ 环境:%@ AF:%@ 参数:%@\n探测:%@\n详见 Documents/Tweaks/kugou/diag.txt",
-            KG_VER,
-            H_Login?@"OK":@"MISS", H_EnvInit?@"OK":@"MISS", H_AF?@"OK":@"MISS", H_Common?@"OK":@"MISS",
-            KGProbeReport.length ? @"见文件" : @"无候选"]);
+        KGWriteDiag([NSString stringWithFormat:@"%@诊断: 缺凭据 login=%@ env=%@ af=%@ common=%@",
+                     KG_VER, H_Login?@"OK":@"MISS", H_EnvInit?@"OK":@"MISS",
+                     H_AF?@"OK":@"MISS", H_Common?@"OK":@"MISS"]);
     }
 }
 
@@ -1638,14 +1617,8 @@ static void KGBootstrap(void) {
     KGInstallHooksOnce();
     KGScheduleHookRetry(120);
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        KGVipAlert([NSString stringWithFormat:@"已加载(%@)", KG_VER]);
-    });
-
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        static BOOL announced = NO;
         KGLoadCreds();
         KGReadCredsFile();
         KGReadHistoryToken();
@@ -1654,19 +1627,15 @@ static void KGBootstrap(void) {
         KGDigAllOnce();
         NSString *token = nil, *userid = nil;
         @synchronized (KGCreds) { token = KGCreds[@"token"]; userid = KGCreds[@"userid"]; }
-        if (token.length > 0 && userid.length > 0 && !announced) {
-            announced = YES;
-            KGVipAlert([NSString stringWithFormat:@"凭据已采集(%@)，5 秒后自动领取\nsalt=%@ appid=%@", KG_VER,
-                        KGCurSalt().length > 12 ? [KGCurSalt() substringToIndex:12] : KGCurSalt(), KGCurAppid()]);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ KGDoClaim(); });
+        if (token.length > 0 && userid.length > 0) {
+            KGDoClaim();
         }
     });
 
     NSArray *delays = @[@25, @45, @90, @180, @300];
     for (NSNumber *d in delays) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ KGAutoClaimTick(d.integerValue == 45); });
+                       dispatch_get_main_queue(), ^{ KGAutoClaimTick(NO); });
     }
 }
 
