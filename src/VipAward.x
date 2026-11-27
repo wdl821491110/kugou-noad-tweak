@@ -10,7 +10,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 
-#define KG_VER   @"v15"
+#define KG_VER   @"v15b"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"
@@ -999,8 +999,16 @@ static void KGDoClaim(void) {
             else { msg = [NSString stringWithFormat:@"签到失败 code=%@ status=%@ msg=%@", em, KGStr(json[@"status"]), KGStr(json[@"error_msg"])]; }
         }
         BOOL kgFail = ([msg hasPrefix:@"签到失败"] || [msg hasPrefix:@"签到网络错误"]);
+        BOOL kgNoop = [msg isEqualToString:@"今天已签到"];
         static BOOL kgFailAlerted = NO;
-        if (!kgFail || !kgFailAlerted) {
+        if (kgNoop) {
+            // 131001 说明 token 已被服务端接受（否则只会是 51002/20018/20006），方案成立
+            static BOOL kgOkAlerted = NO;
+            if (!kgOkAlerted) {
+                kgOkAlerted = YES;
+                KGVipAlert([NSString stringWithFormat:@"%@：token 有效，今日已领，明天打开自动领", KG_VER]);
+            }
+        } else if (!kgFail || !kgFailAlerted) {
             if (kgFail) { kgFailAlerted = YES; }
             KGVipAlert([NSString stringWithFormat:@"自动领(%@)：%@", KG_VER, msg]);
         }
@@ -1030,8 +1038,9 @@ static void KGDoUpgrade(void) {
             else { msg = [NSString stringWithFormat:@"升级失败 code=%@ status=%@ msg=%@", em, KGStr(json[@"status"]), KGStr(json[@"error_msg"])]; }
         }
         BOOL kgFail = ([msg hasPrefix:@"升级失败"] || [msg hasPrefix:@"升级网络错误"]);
+        BOOL kgNoop = [msg isEqualToString:@"今天已签到"];
         static BOOL kgUpFailAlerted = NO;
-        if (!kgFail || !kgUpFailAlerted) {
+        if (!kgNoop && (!kgFail || !kgUpFailAlerted)) {
             if (kgFail) { kgUpFailAlerted = YES; }
             KGVipAlert([NSString stringWithFormat:@"自动领(%@)：%@", KG_VER, msg]);
         }
