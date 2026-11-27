@@ -1,6 +1,6 @@
-TARGET := kugou_noad
-CC := clang
-ARCHS := arm64
+ARCHS = arm64
+TARGET = iphone:clang:16.5:14.0
+export TARGET
 
 include $(THEOS)/makefiles/common.mk
 
