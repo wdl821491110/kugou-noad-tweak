@@ -99,6 +99,24 @@
 - (void)sendEnterClickBIWithSourceId:(id)a type:(id)b { }
 %end
 
+/* ============ 屏蔽 Siri 词表注册 ============ */
+/* 酷狗会向 Siri 注册自定义词表（歌手名/歌名），这里拦截掉 */
+%hook KGMediaIntentStartTask
+- (void)registerCustomVocabulary {
+    KGLog(@"block Siri custom vocabulary registration");
+    // 不调用原实现：不向 Siri 注册词表
+}
+%end
+
+/* INVocabulary 是苹果系统类，setVocabularyStrings:ofType: 是词表写入口。
+ * hook 置空，覆盖所有走系统 API 的词表注册路径（ofType 为 NSInteger 枚举）。 */
+%hook INVocabulary
+- (void)setVocabularyStrings:(id)strings ofType:(NSInteger)type {
+    KGLog(@"block INVocabulary setVocabularyStrings");
+    // 不写入任何词表
+}
+%end
+
 /* ============ 播放器页广告 View（保险：直接隐藏） ============ */
 /* 这些类归属确定的用 hook；找不到归属的靠上面请求层拦截兜底 */
 
