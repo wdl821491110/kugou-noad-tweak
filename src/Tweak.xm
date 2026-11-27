@@ -1,12 +1,15 @@
 /* 酷狗音乐概念版 5.3.3 (com.kugou.kgyouth) 去广告 + 精简 tweak
  *
- * v3 = v2 运行时挂载 + A+C 弹窗精简：
+ * v4 = v3 + 真实 show 方法拦截：
  *  - v2：全部 hook 改为「运行时挂载」。原因：LiveContainer 里 tweak 常在宿主
  *    进程早期加载，此时客制 App 的 ObjC 类还没注册，Logos %hook 在 %ctor 里
  *    拿不到类，hook 全失效（广告还在、Siri 词表照常注册并崩溃）。现用
  *    objc_getClass + method_setImplementation，多时机重试，类何时注册何时挂。
- *  - A 运营弹窗：KGAlertManager / YouthAlertQueueJob 调度层，按 selector 全局挂载。
- *  - C 更新/VIP 到期弹窗：checkAndShowUpdateMessage / checkShowVIPExpireAlert 等。
+ *  - v3：A 运营弹窗（KGAlertManager / YouthAlertQueueJob）+ C 检查入口
+ *    （checkShowVIPExpireAlert 等），按 selector 全局挂载。
+ *  - v4：v3 只拦了「检查」入口，实际弹窗由 show* 方法绘制，导致 VIP 到期弹窗和
+ *    签到弹窗仍出现。补拦真实显示方法：showAlertWithIsExpire:days:、
+ *    realShowV3WithIsExpire:days:、showCalendarSignInAlert: 等。
  */
 
 @import Foundation;
@@ -112,6 +115,29 @@ static KGSelHook kSelHooks[] = {
     {"checkShowWVIPExpireAlert", (IMP)KGNoopNil},
     {"checkShowPlayPagePriviledgeVipExpireAlert", (IMP)KGNoopNil},
     {"checkShowInviteVipAlert", (IMP)KGNoopNil},
+
+    /* v4: VIP 到期弹窗的真实 show/realShow 方法
+     * （v3 只拦 check*，弹窗仍由下面这些 show 方法绘制） */
+    {"showAlertWithIsExpire:days:", (IMP)KGNoopNil},
+    {"showAlertWithIsExpire:days:isTest:", (IMP)KGNoopNil},
+    {"showWVIPAlertWithIsExpire:days:", (IMP)KGNoopNil},
+    {"showExpireAlert", (IMP)KGNoopNil},
+    {"showExpireAlertWithoutExpire:", (IMP)KGNoopNil},
+    {"showWVIPExpireAlert", (IMP)KGNoopNil},
+    {"showVipExpiredAlertDate", (IMP)KGNoopNil},
+    {"showMusicPacketExpiredAlertDate", (IMP)KGNoopNil},
+    {"showPlayPriviledgeAlert:priviledgeKey:thumb:isExpire:themeId:", (IMP)KGNoopNil},
+    {"realShowV2WithIsExpire:days:", (IMP)KGNoopNil},
+    {"realShowV3WithIsExpire:days:", (IMP)KGNoopNil},
+
+    /* v4: 签到弹窗的真实 show 方法（每天签到赚概念币） */
+    {"showCalendarSignInAlert:", (IMP)KGNoopNil},
+    {"showCalendarSignInAlert:webAlertShowedBlock:", (IMP)KGNoopNil},
+    {"showCalendarSignInAlert:sourceId:webAlertShowedBlock:", (IMP)KGNoopNil},
+    {"p_showCalendarSignInAlert:", (IMP)KGNoopNil},
+    {"showMyPageTaskCenterSignIn", (IMP)KGNoopNil},
+    {"canShowCanlendarSignInAlert", (IMP)KGNoopNil},
+    {"checkShowCalendarSignInAlertWithFirstPlay", (IMP)KGNoopNil},
 };
 static const NSUInteger kSelHookCount = sizeof(kSelHooks) / sizeof(kSelHooks[0]);
 
