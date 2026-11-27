@@ -36,13 +36,13 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p $GITHUB_WORKSPACE/out
-          # release 构建：唯一产物在 .theos/obj/kugou_noad_v9f.dylib
-          cp .theos/obj/kugou_noad_v9f.dylib $GITHUB_WORKSPACE/out/
+          # release 构建：唯一产物在 .theos/obj/kugou_noad_v9g.dylib
+          cp .theos/obj/kugou_noad_v9g.dylib $GITHUB_WORKSPACE/out/
           ls -la $GITHUB_WORKSPACE/out
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KGNoAd-v9f
+          name: KGNoAd-v9g
           path: out/*
           if-no-files-found: error
