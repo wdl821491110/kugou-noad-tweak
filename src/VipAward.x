@@ -7,7 +7,7 @@
 #import <objc/message.h>
 #import <CommonCrypto/CommonDigest.h>
 
-#define KG_VER   @"v5"
+#define KG_VER   @"v6"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"   // DL Music calculateMid 风格的固定 30 位十进制
@@ -95,6 +95,20 @@ static void KGVipAlert(NSString *msg) {
 }
 
 // ---------- 凭据采集 ----------
+// 主动读 KGHistoryUserTokenManager（持久化 userId+token，登录后必落盘，最可靠）
+static void KGReadHistoryToken(void) {
+    Class c = objc_getClass("KGHistoryUserTokenManager");
+    if (!c) { return; }
+    id inst = ((id(*)(id, SEL))objc_msgSend)((id)c, sel_registerName("sharedInstance"));
+    if (!inst) { return; }
+    NSString *uid = KGStr(((id(*)(id, SEL))objc_msgSend)(inst, sel_registerName("getLatestLoginUserId")));
+    if (uid.length == 0) { return; }
+    id model = ((id(*)(id, SEL, id))objc_msgSend)(inst, sel_registerName("getHistoryUserTokenModel:"), uid);
+    if (!model) { return; }
+    NSString *tok = KGStr(((id(*)(id, SEL))objc_msgSend)(model, sel_registerName("token")));
+    if (tok.length > 0) { KGSaveCreds(tok, uid); }
+}
+
 // 主动读登录管理器：KGSVUserInfoManager.shareInstance 的 token / kugouId / isLogin
 static void KGReadLoginManager(void) {
     Class c = objc_getClass("KGSVUserInfoManager");
@@ -234,6 +248,7 @@ static void KGDoUpgrade(void) {
 static void KGAutoClaimTick(BOOL verbose) {
     if (KGDoneToday) { return; }
     KGLoadCreds();
+    KGReadHistoryToken();
     KGReadLoginManager();
     @synchronized (KGCreds) {
         if (KGStr(KGCreds[@"token"]).length == 0 || KGStr(KGCreds[@"userid"]).length == 0) {
@@ -261,8 +276,27 @@ static void KGAutoClaimTick(BOOL verbose) {
             }
         }
         NSString *scan = KGScanUserDefaults() ? @"有" : @"无";
-        KGVipAlert([NSString stringWithFormat:@"%@诊断: 缺[token,userid]\n管理器类:%@ 实例:%@ isLogin:%@\ntoken长度:%@ kugouId:%@\nUserDefaults兜底:%@",
-                    KG_VER, c ? @"有" : @"无", hasInst ? @"有" : @"无", login ? @"Y" : @"N", tokLen, kid, scan]);
+        // 历史账号存储诊断
+        NSString *histInfo = @"类:无";
+        Class hc = objc_getClass("KGHistoryUserTokenManager");
+        if (hc) {
+            id hinst = ((id(*)(id, SEL))objc_msgSend)((id)hc, sel_registerName("sharedInstance"));
+            if (hinst) {
+                NSString *huid = KGStr(((id(*)(id, SEL))objc_msgSend)(hinst, sel_registerName("getLatestLoginUserId")));
+                NSString *htok = @"";
+                if (huid.length > 0) {
+                    id hm = ((id(*)(id, SEL, id))objc_msgSend)(hinst, sel_registerName("getHistoryUserTokenModel:"), huid);
+                    if (hm) { htok = KGStr(((id(*)(id, SEL))objc_msgSend)(hm, sel_registerName("token"))); }
+                }
+                histInfo = [NSString stringWithFormat:@"类:有 uid:%@ token长度:%lu",
+                            huid.length > 0 ? huid : @"空",
+                            (unsigned long)htok.length];
+            } else {
+                histInfo = @"类:有 实例:无";
+            }
+        }
+        KGVipAlert([NSString stringWithFormat:@"%@诊断: 缺[token,userid]\n管理器类:%@ 实例:%@ isLogin:%@\ntoken长度:%@ kugouId:%@\nUserDefaults兜底:%@\n历史账号存储:%@",
+                    KG_VER, c ? @"有" : @"无", hasInst ? @"有" : @"无", login ? @"Y" : @"N", tokLen, kid, scan, histInfo]);
     }
 }
 
@@ -300,6 +334,7 @@ static void KGBootstrap(void) {
                    dispatch_get_main_queue(), ^{
         static BOOL announced = NO;
         KGLoadCreds();
+        KGReadHistoryToken();
         KGReadLoginManager();
         NSString *token = nil, *userid = nil;
         @synchronized (KGCreds) { token = KGCreds[@"token"]; userid = KGCreds[@"userid"]; }
