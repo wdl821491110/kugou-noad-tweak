@@ -8,8 +8,9 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <Security/Security.h>
 
-#define KG_VER   @"v12"
+#define KG_VER   @"v13"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"
@@ -44,6 +45,10 @@ static NSString *KGAppAppid = nil, *KGAppClientver = nil, *KGAppSalt = nil;
 static NSString *KGNetObsReport = @"";
 static BOOL H_SignA = NO, H_SignB = NO, H_DaoKey = NO, H_DaoInfo = NO;
 static IMP KGOrigSignA = NULL, KGOrigSignB = NULL, KGOrigDaoKey = NULL, KGOrigDaoInfo = NULL;
+// v13：钥匙串 / Cookie 里的真实凭据
+static NSMutableArray *KGKeyCands = nil;
+static NSMutableString *KGKeyReport = nil;
+static NSMutableString *KGCookieReport = nil;
 
 // ---------- 工具 ----------
 static NSString *KGMD5(NSString *in) {
@@ -284,6 +289,10 @@ static void KGWriteDiag(NSString *extra) {
         KGAppUid.length ? KGAppUid : @"-",
         KGAppDfid.length ? KGAppDfid : @"-",
         KGAppMid.length ? KGAppMid : @"-"];
+    [s appendString:@"keychain:"];
+    [s appendString:KGKeyReport.length ? KGKeyReport : @" (未运行)\n"];
+    [s appendString:@"cookies:"];
+    [s appendString:KGCookieReport.length ? KGCookieReport : @" (未运行)\n"];
     // 概念版用户状态的键（脱敏）
     {
         id st = [[NSUserDefaults standardUserDefaults] objectForKey:@"YouthUserStateInfoKey"];
@@ -349,6 +358,122 @@ static void KGWriteDiag(NSString *extra) {
     [[NSFileManager defaultManager] createDirectoryAtPath:[p stringByDeletingLastPathComponent]
                               withIntermediateDirectories:YES attributes:nil error:nil];
     [s writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+// ---------- 钥匙串 / Cookie 凭据挖掘 ----------
+static void KGPushKeyCand(NSString *src, id token, id uid) {
+    NSString *t = KGStr(token);
+    NSString *u = KGStr(uid);
+    if (t.length < 32 || t.length > 200) { return; }
+    if ([t rangeOfString:@" "].location != NSNotFound) { return; }
+    if (!KGKeyCands) { KGKeyCands = [NSMutableArray array]; }
+    for (NSDictionary *d in KGKeyCands) {
+        if ([d[@"token"] isEqualToString:t]) { return; }
+    }
+    [KGKeyCands addObject:@{@"src": src, @"token": t, @"uid": u}];
+}
+
+static void KGDigCreds(NSString *src, id value) {
+    if (!value) { return; }
+    NSString *sv = nil;
+    if ([value isKindOfClass:NSString.class]) { sv = value; }
+    else if ([value isKindOfClass:NSData.class]) {
+        sv = [[NSString alloc] initWithData:(NSData *)value encoding:NSUTF8StringEncoding];
+    }
+    if (!sv.length) { return; }
+    NSString *trim = [sv stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!trim.length) { return; }
+    if ([trim hasPrefix:@"{"] || [trim hasPrefix:@"["]) {
+        id j = nil;
+        @try {
+            j = [NSJSONSerialization JSONObjectWithData:[trim dataUsingEncoding:NSUTF8StringEncoding]
+                                                options:0 error:nil];
+        } @catch (__unused NSException *ex) {}
+        if ([j isKindOfClass:NSDictionary.class]) {
+            NSDictionary *d = j;
+            id t = d[@"token"] ?: d[@"userToken"] ?: d[@"usertoken"] ?: d[@"tk"] ?: d[@"access_token"];
+            id u = d[@"userid"] ?: d[@"kugouid"] ?: d[@"userId"] ?: d[@"uid"];
+            if (t) { KGPushKeyCand(src, t, u); }
+            return;
+        }
+    }
+    if (trim.length >= 32 && trim.length <= 200 &&
+        [trim rangeOfString:@" "].location == NSNotFound &&
+        [trim rangeOfString:@"{"].location == NSNotFound) {
+        KGPushKeyCand(src, trim, nil);
+    }
+}
+
+static void KGDumpKeychain(void) {
+    if (!KGKeyReport) { KGKeyReport = [NSMutableString string]; }
+    NSArray *classes = @[(__bridge id)kSecClassGenericPassword, (__bridge id)kSecClassInternetPassword];
+    NSArray *tags = @[@"gen", @"net"];
+    for (NSUInteger ci = 0; ci < classes.count; ci++) {
+        NSMutableDictionary *q = [NSMutableDictionary dictionary];
+        q[(__bridge id)kSecClass] = classes[ci];
+        q[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitAll;
+        q[(__bridge id)kSecReturnAttributes] = @YES;
+        q[(__bridge id)kSecReturnData] = @YES;
+        CFTypeRef out = NULL;
+        OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &out);
+        if (st != errSecSuccess || !out) {
+            [KGKeyReport appendFormat:@" %@: st=%d\n", tags[ci], (int)st];
+            continue;
+        }
+        NSArray *items = (__bridge_transfer NSArray *)out;
+        [KGKeyReport appendFormat:@" %@ count=%lu\n", tags[ci], (unsigned long)items.count];
+        for (NSDictionary *it in items) {
+            NSString *svc = KGStr(it[(__bridge id)kSecAttrService]);
+            NSString *acct = KGStr(it[(__bridge id)kSecAttrAccount]);
+            id data = it[(__bridge id)kSecValueData];
+            NSString *vs = nil;
+            if ([data isKindOfClass:NSData.class]) {
+                vs = [[NSString alloc] initWithData:(NSData *)data encoding:NSUTF8StringEncoding];
+            }
+            NSString *shown = vs.length ? vs : ([data isKindOfClass:NSData.class]
+                    ? [NSString stringWithFormat:@"data(%lu)", (unsigned long)[(NSData *)data length]]
+                    : KGVDesc(data));
+            [KGKeyReport appendFormat:@"   [%@/%@] %@\n", svc.length ? svc : @"-", acct.length ? acct : @"-",
+                KGVDesc(shown)];
+            KGDigCreds([NSString stringWithFormat:@"KC:%@", svc.length ? svc : @"-"], vs ?: data);
+            if (!KGAppUid.length && acct.length > 4 && acct.length < 14 &&
+                [acct rangeOfCharacterFromSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location == NSNotFound) {
+                KGAppUid = acct;
+            }
+        }
+    }
+}
+
+static void KGDumpCookies(void) {
+    if (!KGCookieReport) { KGCookieReport = [NSMutableString string]; }
+    NSArray *cs = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies];
+    [KGCookieReport appendFormat:@" count=%lu\n", (unsigned long)cs.count];
+    NSMutableDictionary *kv = [NSMutableDictionary dictionary];
+    for (NSHTTPCookie *c in cs) {
+        NSString *nm = c.name ?: @"";
+        NSString *val = c.value ?: @"";
+        NSString *dom = c.domain ?: @"";
+        if ([dom containsString:@"kugou"] || val.length > 24) {
+            [KGCookieReport appendFormat:@"   %@ %@=%@\n", dom, nm, KGVDesc(val)];
+        }
+        if (val.length >= 8) { kv[nm.lowercaseString] = val; }
+    }
+    NSString *t = kv[@"token"] ?: kv[@"usertoken"];
+    NSString *u = kv[@"userid"] ?: kv[@"kugouid"];
+    if (t) { KGPushKeyCand(@"cookie", t, u); }
+    if (KGUsable(kv[@"dfid"]) && !KGAppDfid) { KGAppDfid = kv[@"dfid"]; }
+    if (KGUsable(kv[@"mid"]) && !KGAppMid) { KGAppMid = kv[@"mid"]; }
+}
+
+// 读 KGEnvironment 实例上的 mId / appId（请求机签用的真实设备号）
+static void KGReadEnvFields(void) {
+    if (!KGLastEnv) { return; }
+    @try {
+        NSString *md = KGStr(((id(*)(id, SEL))objc_msgSend)(KGLastEnv, sel_registerName("mId")));
+        NSString *ap = KGStr(((id(*)(id, SEL))objc_msgSend)(KGLastEnv, sel_registerName("appId")));
+        if (KGUsable(md) && !KGAppMid) { KGAppMid = md; }
+        if (KGUsable(ap) && !KGAppAppid) { KGAppAppid = ap; }
+    } @catch (__unused NSException *ex) {}
 }
 
 // ---------- 凭据采集（主动读） ----------
@@ -546,12 +671,24 @@ static void KGGet(NSString *path, NSMutableDictionary *params,
 }
 
 // ---------- App 内真实接口探测 ----------
-// 概念版二进制里存在的领奖/签到接口（从 IPA 字符串表提取），逐个用当前 token 试探
+// 响应有两种格式：@/youth/* 用 error_code/error_msg，@/concepts/* 用 errcode/errmsg
+static NSString *KGRespCode(NSDictionary *json) {
+    NSString *c = KGStr(json[@"error_code"]);
+    if (!c.length) { c = KGStr(json[@"errcode"]); }
+    return c;
+}
+static NSString *KGRespMsg(NSDictionary *json) {
+    NSString *m = KGStr(json[@"error_msg"]);
+    if (!m.length) { m = KGStr(json[@"errmsg"]); }
+    return m;
+}
+
 static void KGProbeQueue(NSArray *defs, NSUInteger i, NSMutableArray *acc,
                          NSMutableArray *oks, void (^done)(void)) {
-    if (i >= defs.count) {
+    if (!defs || i >= defs.count) {
+        for (NSDictionary *d in oks) { (void)d; }
         KGAPITestReport = [acc componentsJoinedByString:@"\n"];
-        done();
+        if (done) { done(); }
         return;
     }
     NSArray *def = defs[i];
@@ -562,11 +699,13 @@ static void KGProbeQueue(NSArray *defs, NSUInteger i, NSMutableArray *acc,
         if (err) {
             line = [NSString stringWithFormat:@"%@ %@ -> ERR %@", method, path, err.localizedDescription];
         } else {
+            NSString *code = KGRespCode(json);
+            NSString *msg = KGRespMsg(json);
             NSInteger st = [KGStr(json[@"status"]) integerValue];
-            NSString *code = KGStr(json[@"error_code"]);
-            line = [NSString stringWithFormat:@"%@ %@ -> status=%ld code=%@ msg=%@",
-                    method, path, (long)st, code, KGStr(json[@"error_msg"])];
-            if (st == 1 || [code isEqualToString:@"131001"]) {
+            line = [NSString stringWithFormat:@"%@ %@ -> status=%ld code=%@ %@",
+                    method, path, (long)st, code.length ? code : @"-", msg];
+            BOOL ok = (st == 1) || [code isEqualToString:@"0"] || [code isEqualToString:@"131001"];
+            if (ok) {
                 [oks addObject:line];
                 line = [line stringByAppendingString:@"  <== 可用"];
             }
@@ -593,32 +732,41 @@ static void KGProbeApis(void (^done)(void)) {
         if (done) { done(); }
         return;
     }
-    NSArray *defs = @[
-        @[@"POST", @"/youth/v1/recharge/receive_vip_listen_song",
-          (@{@"source_id": @"90139", @"receive_day": KGTodayString(), @"token": token, @"userid": uid})],
-        @[@"POST", @"/youth/v1/listen_song/upgrade_vip_reward",
-          (@{@"kugouid": uid, @"ad_type": @"1", @"token": token, @"userid": uid})],
-        @[@"GET", @"/concepts/v1/free_mode/receive_vip_morning",
-          (@{@"token": token, @"userid": uid})],
-        @[@"GET", @"/youth/v1/ad/get_ad_vip_time",
-          (@{@"token": token, @"userid": uid})],
-        @[@"GET", @"/youth/v1/free_package/get_vip_task",
-          (@{@"token": token, @"userid": uid})],
-        @[@"GET", @"/youth/v1/player/get_user_free_info",
-          (@{@"token": token, @"userid": uid})],
-        @[@"GET", @"/youth/v1/account/get_vip_tips",
-          (@{@"token": token, @"userid": uid})],
-        @[@"GET", @"/concepts/v1/recharge/receive_365_welfare",
-          (@{@"token": token, @"userid": uid})],
-    ];
-    NSMutableArray *acc = [NSMutableArray array];
-    NSMutableArray *oks = [NSMutableArray array];
-    KGProbeQueue(defs, 0, acc, oks, ^{
-        running = NO;
-        if (oks.count > 0) {
-            KGVipAlert([NSString stringWithFormat:@"%@接口探测命中 %lu 个(见 diag)", KG_VER, (unsigned long)oks.count]);
-        }
-        if (done) { done(); }
+    // ① 先判定 token 是否有效（GET get_vip_tips：51002=无效，其它=有效；20006=签名错）
+    NSMutableDictionary *vt = [NSMutableDictionary dictionary];
+    vt[@"token"] = token;
+    vt[@"userid"] = uid;
+    KGGet(@"/youth/v1/account/get_vip_tips", vt, ^(NSDictionary *json, NSError *err) {
+        NSString *code = KGRespCode(json);
+        NSString *valid = @"?";
+        if (code.length) { valid = [code isEqualToString:@"51002"] ? @"N" : @"Y"; }
+        NSString *head = [NSString stringWithFormat:@"tokenValid: %@ (code=%@ %@, salt=%@ appid=%@ dfid=%@)",
+                          valid, code.length ? code : @"-", KGRespMsg(json),
+                          KGCurSalt(), KGCurAppid(), KGCurDfid()];
+        // ② 概念版真实接口（POST；响应 errcode 0=成功）
+        NSArray *defs = @[
+            @[@"POST", @"/concepts/v1/free_mode/receive_vip_morning",
+              (@{@"token": token, @"userid": uid})],
+            @[@"POST", @"/concepts/v1/recharge/receive_365_welfare",
+              (@{@"token": token, @"userid": uid})],
+            @[@"GET", @"/youth/v1/ad/get_ad_vip_time",
+              (@{@"token": token, @"userid": uid})],
+            @[@"GET", @"/youth/v1/free_package/get_vip_task",
+              (@{@"token": token, @"userid": uid})],
+            @[@"GET", @"/youth/v1/player/get_user_free_info",
+              (@{@"token": token, @"userid": uid})],
+            @[@"POST", @"/youth/v1/recharge/receive_vip_listen_song",
+              (@{@"source_id": @"90139", @"receive_day": KGTodayString(), @"token": token, @"userid": uid})],
+        ];
+        NSMutableArray *acc = [NSMutableArray arrayWithObject:head];
+        NSMutableArray *oks = [NSMutableArray array];
+        KGProbeQueue(defs, 0, acc, oks, ^{
+            running = NO;
+            if (oks.count > 0) {
+                KGVipAlert([NSString stringWithFormat:@"%@接口探测命中 %lu 个(见 diag)", KG_VER, (unsigned long)oks.count]);
+            }
+            if (done) { done(); }
+        });
     });
 }
 
@@ -667,6 +815,16 @@ static NSMutableArray *KGCollectCandidates(void) {
     // App 自身真实请求里观测到的 token 优先级最高
     if (KGAppToken.length >= 32 && KGAppUid.length > 0) {
         KGAddCand(out, @"AppObserved", KGAppToken, KGAppUid);
+    }
+    // 钥匙串 / Cookie 里挖到的 token（uid 缺失时用已知 uid 兜底配对）
+    if (KGKeyCands.count) {
+        NSString *fbUid = KGAppUid;
+        @synchronized (KGCreds) { if (!fbUid.length) { fbUid = KGStr(KGCreds[@"userid"]); } }
+        for (NSDictionary *d in KGKeyCands) {
+            NSString *u = KGStr(d[@"uid"]);
+            if (!u.length) { u = fbUid; }
+            KGAddCand(out, d[@"src"], d[@"token"], u);
+        }
     }
     @synchronized (KGCreds) { KGAddCand(out, @"creds", KGCreds[@"token"], KGCreds[@"userid"]); }
 
@@ -717,45 +875,47 @@ static NSMutableArray *KGCollectCandidates(void) {
     return out;
 }
 
-// ---------- 逐个候选实打签到，记录错误码 ----------
-static void KGTestTokenLine(NSString *src, NSString *t, NSString *u,
-                            void (^done)(NSString *line, NSInteger status, NSString *code)) {
+// ---------- 逐个候选做 token 有效性判定（GET get_vip_tips） ----------
+static void KGTestTokenLine(NSString *src, NSString *t, NSString *u, void (^done)(NSString *line, BOOL valid)) {
+    if (u.length == 0) {
+        done([NSString stringWithFormat:@"%@ tok=%@(%lu) -> 缺 uid，跳过", src, KGMaskToken(t), (unsigned long)t.length], NO);
+        return;
+    }
     NSMutableDictionary *p = [NSMutableDictionary dictionary];
-    p[@"source_id"] = @"90139";
-    p[@"receive_day"] = KGTodayString();
     p[@"token"] = t;
     p[@"userid"] = u;
-    KGPost(@"/youth/v1/recharge/receive_vip_listen_song", p, ^(NSDictionary *json, NSError *err) {
+    KGGet(@"/youth/v1/account/get_vip_tips", p, ^(NSDictionary *json, NSError *err) {
         if (err) {
-            done([NSString stringWithFormat:@"%@ tok=%@(%lu) uid=%@ -> ERR %@",
-                  src, KGMaskToken(t), (unsigned long)t.length, u, err.localizedDescription], -1, @"");
+            done([NSString stringWithFormat:@"%@ tok=%@ uid=%@ -> ERR %@",
+                  src, KGMaskToken(t), u, err.localizedDescription], NO);
             return;
         }
-        NSInteger st = [KGStr(json[@"status"]) integerValue];
-        NSString *code = KGStr(json[@"error_code"]);
-        done([NSString stringWithFormat:@"%@ tok=%@(%lu) uid=%@ -> status=%ld code=%@ msg=%@",
-              src, KGMaskToken(t), (unsigned long)t.length, u, (long)st, code, KGStr(json[@"error_msg"])],
-             st, code);
+        NSString *code = KGRespCode(json);
+        NSString *msg = KGRespMsg(json);
+        BOOL valid = (code.length > 0) && ![code isEqualToString:@"51002"] && ![code isEqualToString:@"20006"];
+        done([NSString stringWithFormat:@"%@ tok=%@(%lu) uid=%@ -> code=%@ %@ tokenValid=%@",
+              src, KGMaskToken(t), (unsigned long)t.length, u, code.length ? code : @"-", msg,
+              valid ? @"Y" : @"N"], valid);
     });
 }
 
 static void KGTestQueue(NSArray *cands, NSUInteger i, NSMutableArray *acc, void (^done)(void)) {
     if (i >= cands.count) {
         KGTokenTestReport = [acc componentsJoinedByString:@"\n"];
-        done();
+        if (done) { done(); }
         return;
     }
     NSDictionary *c = cands[i];
-    KGTestTokenLine(c[@"src"], c[@"token"], c[@"uid"], ^(NSString *line, NSInteger st, NSString *code) {
-        BOOL ok = (st == 1 || [code isEqualToString:@"131001"]);
-        [acc addObject:ok ? [line stringByAppendingString:@"  <== 可用"] : line];
-        if (ok) {
+    KGTestTokenLine(c[@"src"], c[@"token"], c[@"uid"], ^(NSString *line, BOOL valid) {
+        [acc addObject:valid ? [line stringByAppendingString:@"  <== 可用"] : line];
+        if (valid) {
             @synchronized (KGCreds) {
                 KGCreds[@"token"] = c[@"token"];
                 KGCreds[@"userid"] = c[@"uid"];
                 KGCredsLoaded = YES;
                 [[NSUserDefaults standardUserDefaults] setObject:[KGCreds copy] forKey:KG_CREDS_KEY];
             }
+            if (KGAppUid.length == 0) { KGAppUid = c[@"uid"]; }
         }
         KGTestQueue(cands, i + 1, acc, done);
     });
@@ -783,9 +943,12 @@ static void KGDoUpgrade(void);
 
 static void KGDoClaim(void) {
     if (KGDoneToday) { return; }
+    static BOOL inflight = NO;
+    if (inflight) { return; }
     NSString *token = nil, *userid = nil;
     @synchronized (KGCreds) { token = KGCreds[@"token"]; userid = KGCreds[@"userid"]; }
     if (token.length == 0 || userid.length == 0) { return; }
+    inflight = YES;
 
     NSMutableDictionary *p = [NSMutableDictionary dictionary];
     p[@"source_id"] = @"90139";
@@ -811,6 +974,7 @@ static void KGDoClaim(void) {
             KGVipAlert([NSString stringWithFormat:@"自动领(%@)：%@", KG_VER, msg]);
         }
         KGWriteDiag(msg);
+        inflight = NO;
         if ([msg hasPrefix:@"签到成功"] || [msg isEqualToString:@"今天已签到"]) { KGDoUpgrade(); }
     });
 }
@@ -858,6 +1022,15 @@ static BOOL KGSyncFromObserved(void) {
     return YES;
 }
 
+static void KGDigAllOnce(void) {
+    static BOOL dug = NO;
+    if (dug) { return; }
+    dug = YES;
+    KGReadEnvFields();
+    KGDumpKeychain();
+    KGDumpCookies();
+}
+
 static void KGAutoClaimTick(BOOL verbose) {
     if (KGDoneToday) { return; }
     KGLoadCreds();
@@ -865,6 +1038,7 @@ static void KGAutoClaimTick(BOOL verbose) {
     KGReadHistoryToken();
     KGReadLoginManager();
     KGSyncFromObserved();
+    KGDigAllOnce();
     if (KGLastEnv) {
         @try {
             NSString *t = KGStr(((id(*)(id, SEL))objc_msgSend)(KGLastEnv, sel_registerName("token")));
@@ -880,13 +1054,12 @@ static void KGAutoClaimTick(BOOL verbose) {
         @synchronized (KGCreds) { token = KGCreds[@"token"]; userid = KGCreds[@"userid"]; }
     }
     if (verbose) {
-        // 45 秒诊断：① 用当前 token 逐个试探 App 内真实领奖接口；② 若无命中再试其它候选 token
-        KGProbeApis(^{
-            if (KGAPITestReport.length && [KGAPITestReport containsString:@"可用"]) {
-                KGWriteDiag(@"diag-tick(apiprobe hit)");
-            } else {
-                KGRunTokenTests(^{ KGWriteDiag(@"diag-tick(after apiprobe+tokentest)"); });
-            }
+        // 45 秒诊断：① 逐个候选 token 判定有效性；② 用当前 token 试探概念版真实接口；③ 再试领取
+        KGRunTokenTests(^{
+            KGProbeApis(^{
+                KGWriteDiag(@"diag-tick");
+                KGDoClaim();
+            });
         });
     }
     if (token.length > 0 && userid.length > 0) {
@@ -1168,6 +1341,7 @@ static void KGBootstrap(void) {
         KGReadHistoryToken();
         KGReadLoginManager();
         KGSyncFromObserved();
+        KGDigAllOnce();
         NSString *token = nil, *userid = nil;
         @synchronized (KGCreds) { token = KGCreds[@"token"]; userid = KGCreds[@"userid"]; }
         if (token.length > 0 && userid.length > 0 && !announced) {
