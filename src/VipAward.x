@@ -7,7 +7,7 @@
 #import <objc/message.h>
 #import <CommonCrypto/CommonDigest.h>
 
-#define KG_VER   @"v7"
+#define KG_VER   @"v8"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"   // DL Music calculateMid 风格的固定 30 位十进制
@@ -23,6 +23,10 @@ static NSMutableDictionary *KGCreds = nil;
 static BOOL KGCredsLoaded = NO;
 static BOOL KGDoneToday = NO;
 static IMP KGOrigLoginSetter = NULL;
+static IMP KGOrigEnvInit = NULL;
+static IMP KGOrigEnvTok = NULL;
+static IMP KGOrigAF = NULL;
+static id KGLastEnv = nil;
 static BOOL KGHooksInstalled = NO;
 
 // ---------- 工具 ----------
@@ -268,6 +272,11 @@ static void KGAutoClaimTick(BOOL verbose) {
     KGReadCredsFile();
     KGReadHistoryToken();
     KGReadLoginManager();
+    if (KGLastEnv) {
+        NSString *t = KGStr(((id(*)(id, SEL))objc_msgSend)(KGLastEnv, sel_registerName("token")));
+        NSString *u = KGStr(((id(*)(id, SEL))objc_msgSend)(KGLastEnv, sel_registerName("userID")));
+        if (t.length > 0 && u.length > 0) { KGSaveCreds(t, u); }
+    }
     @synchronized (KGCreds) {
         if (KGStr(KGCreds[@"token"]).length == 0 || KGStr(KGCreds[@"userid"]).length == 0) {
             KGScanUserDefaults();
@@ -335,6 +344,64 @@ static void KGInstallHooks(void) {
     });
     KGOrigLoginSetter = method_setImplementation(m, newImp);
     KGHooksInstalled = YES;
+
+    // KGEnvironment：请求环境对象，构造参数自带 appId/mId/userID/token
+    Class ec = objc_getClass("KGEnvironment");
+    if (ec) {
+        SEL isel = sel_registerName("initWithAppId:mId:userID:token:appVersion:channelId:vipType:musicType:isVip:pType:");
+        Method im = class_getInstanceMethod(ec, isel);
+        if (im) {
+            IMP ni = imp_implementationWithBlock(^(id self, id appId, id mId, id uid, id tok, id ver, id ch,
+                                                   unsigned long long vipType, unsigned long long musicType, BOOL isVip, long long pType) {
+                id r = nil;
+                if (KGOrigEnvInit) {
+                    r = ((id(*)(id, SEL, id, id, id, id, id, id, unsigned long long, unsigned long long, BOOL, long long))KGOrigEnvInit)
+                        (self, isel, appId, mId, uid, tok, ver, ch, vipType, musicType, isVip, pType);
+                }
+                KGLastEnv = self;
+                KGSaveCreds(KGStr(tok), KGStr(uid));
+                return r;
+            });
+            KGOrigEnvInit = method_setImplementation(im, ni);
+        }
+        SEL ts = sel_registerName("setToken:");
+        Method tm = class_getInstanceMethod(ec, ts);
+        if (tm) {
+            IMP nt = imp_implementationWithBlock(^(id self, id tok) {
+                if (KGOrigEnvTok) { ((void(*)(id, SEL, id))KGOrigEnvTok)(self, ts, tok); }
+                KGLastEnv = self;
+                NSString *u = KGStr(((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("userID")));
+                KGSaveCreds(KGStr(tok), u);
+            });
+            KGOrigEnvTok = method_setImplementation(tm, nt);
+        }
+    }
+
+    // AFHTTPSessionManager：App 所有 AFNetworking 请求的参数字典必经（token/userid/dfid/mid 全在）
+    Class ac = objc_getClass("AFHTTPSessionManager");
+    if (ac) {
+        SEL asel = sel_registerName("dataTaskWithHTTPMethod:URLString:parameters:headers:uploadProgress:downloadProgress:success:failure:");
+        Method am = class_getInstanceMethod(ac, asel);
+        if (am) {
+            IMP na = imp_implementationWithBlock(^(id self, id method, id urlStr, id params, id headers,
+                                                   id up, id down, id success, id failure) {
+                id r = nil;
+                if (KGOrigAF) {
+                    r = ((id(*)(id, SEL, id, id, id, id, id, id, id, id))KGOrigAF)
+                        (self, asel, method, urlStr, params, headers, up, down, success, failure);
+                }
+                if ([params isKindOfClass:NSDictionary.class]) {
+                    NSDictionary *p = params;
+                    NSString *t = KGStr(p[@"token"]);
+                    NSString *u = KGStr(p[@"userid"]);
+                    if (u.length == 0) { u = KGStr(p[@"kugouid"]); }
+                    if (t.length > 0 && u.length > 0) { KGSaveCreds(t, u); }
+                }
+                return r;
+            });
+            KGOrigAF = method_setImplementation(am, na);
+        }
+    }
 }
 
 static void KGBootstrap(void) {
