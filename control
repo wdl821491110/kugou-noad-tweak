@@ -1,0 +1,9 @@
+Package: com.woond.kugou_noad
+Name: KGNoAd
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Remove ads from Kugou Youth (com.kugou.kgyouth) 5.3.3
+Maintainer: woond
+Author: woond
+Section: Tweaks
+Depends: mobilesubstrate

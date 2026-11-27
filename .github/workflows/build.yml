@@ -1,0 +1,45 @@
+name: Build KGNoAd dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Download iOS SDK
+        run: |
+          git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks
+          mkdir -p $HOME/theos/sdks
+          cp -R $HOME/sdks/iPhoneOS16.5.sdk $HOME/theos/sdks/
+          ls $HOME/theos/sdks
+
+      - name: Build tweak
+        run: |
+          cd $GITHUB_WORKSPACE
+          make clean || true
+          make -j2
+          find . -name "*.dylib" -o -name "*.deb"
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/out
+          find $GITHUB_WORKSPACE -name "kugou_noad.dylib" -exec cp {} $GITHUB_WORKSPACE/out/ \;
+          cp packages/*.deb $GITHUB_WORKSPACE/out/ 2>/dev/null || true
+          ls -la $GITHUB_WORKSPACE/out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KGNoAd
+          path: out/*
+          if-no-files-found: error
