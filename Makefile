@@ -4,8 +4,8 @@ export TARGET
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = kugou_noad_v9e
-kugou_noad_v9e_FILES = src/Tweak.xm
-kugou_noad_v9e_CFLAGS = -fobjc-arc
+TWEAK_NAME = kugou_noad_v9f
+kugou_noad_v9f_FILES = src/Tweak.xm
+kugou_noad_v9f_CFLAGS = -fobjc-arc
 
 include $(THEOS_MAKE_PATH)/tweak.mk

@@ -55,15 +55,18 @@ typedef void (^KGSuccessCB)(id);
  * 3) 按 cell 内文字识别，避免类名猜错。 */
 static NSMutableDictionary *KGOriginalIMPs = nil;
 static NSArray *KGHideKeywords = nil;
+static NSMutableSet *KGHiddenPaths = nil;
 
 static void KGInitRuntimeState(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         KGOriginalIMPs = [NSMutableDictionary dictionary];
+        KGHiddenPaths = [NSMutableSet set];
         KGHideKeywords = @[
             @"TA也喜欢", @"ta也喜欢", @"TA特喜欢", @"ta特喜欢",
             @"概念er新推", @"概念实验室", @"曲风盲盒", @"VIP专属", @"小众宝藏",
-            @"赚钱", @"赚金币", @"赚概念币", @"任务中心"
+            @"赚钱", @"赚金币", @"赚概念币", @"任务中心",
+            @"频道推荐", @"免费听", @"潮流尝鲜"
         ];
     });
 }
@@ -121,6 +124,27 @@ static void KGHideView(UIView *view) {
  * 绝不碰父类，避免误伤普通歌曲 cell。 */
 static void KGHiddenLayout(id self, SEL _cmd) {
     KGHideView((UIView *)self);
+}
+
+/* ============ v9f: 隐藏路径记录 + 高度归零（消除大片空白） ============
+ * v9 曾实现过，当时被误判为黑屏元凶回退；真凶是全局遍历超时（v9e 已修）。
+ * 命中的 collectionView/tableView + indexPath 记进 KGHiddenPaths，
+ * sizeForItem / heightForRow 对这些路径返回 0，并 invalidateLayout 刷新。 */
+static NSString *KGPathKey(id container, NSInteger section, NSInteger index) {
+    return [NSString stringWithFormat:@"%p-%ld-%ld", (__bridge void *)container, (long)section, (long)index];
+}
+
+static BOOL KGIsHiddenPath(id container, NSInteger section, NSInteger index) {
+    KGInitRuntimeState();
+    return [KGHiddenPaths containsObject:KGPathKey(container, section, index)];
+}
+
+static BOOL KGMarkHiddenPath(id container, NSInteger section, NSInteger index) {
+    KGInitRuntimeState();
+    NSString *key = KGPathKey(container, section, index);
+    if ([KGHiddenPaths containsObject:key]) { return NO; }
+    [KGHiddenPaths addObject:key];
+    return YES;
 }
 
 /* 只给「本类」安装方法：绝不用 class_getInstanceMethod（会沿继承链拿到父类实现） */
@@ -229,11 +253,11 @@ static void KGNoop_CB3Bool(id self, SEL _cmd, BOOL a, id success, id error) { KG
 static void KGNoop_CB4Bool(id self, SEL _cmd, BOOL a, id b, id success, id error) { KGCallCB(success); }
 static void KGNoop_CB4Id(id self, SEL _cmd, id a, id b, id success, id error) { KGCallCB(success); }
 
-/* ============ v9/v9b: 按文字隐藏（保留原实现，不改高度） ============
+/* ============ v9/v9b/v9f: 按文字隐藏 + 高度归零 ============
  * 这些 hook 不能置空原实现：先调用 original，再按 cell 内文字判断。
  * 原始 IMP 在 KGInstallSelectorHooks 替换前存进 KGOriginalIMPs。
- * v9b：不再 invalidateLayout / reloadData，也不改 size/height，
- * 避免 UICollectionView 反复重算导致启动黑屏后闪退。 */
+ * v9f：恢复高度归零——命中的路径 sizeForItem/heightForRow 返回 0，
+ * 并 invalidateLayout / reloadData 消除大片空白。 */
 static IMP KGCurrentOriginalIMP(id self, SEL sel) {
     return KGOriginalIMP(class_getInstanceMethod(object_getClass(self), sel));
 }
@@ -242,22 +266,34 @@ static void KGWillDisplayCollectionCell(id self, SEL _cmd, UICollectionView *col
                                         UICollectionViewCell *cell, NSIndexPath *indexPath) {
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, collectionView, cell, indexPath); }
-    if (KGViewTextMatches(cell, 0)) {
-        KGHideView(cell);
-        KGLogAlways(@"hidden collection cell by text: %ld-%ld",
-                    (long)indexPath.section, (long)indexPath.item);
+    if (!KGViewTextMatches(cell, 0)) { return; }
+
+    KGHideView(cell);
+    BOOL fresh = KGMarkHiddenPath(collectionView, indexPath.section, indexPath.item);
+    if (fresh) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [collectionView.collectionViewLayout invalidateLayout];
+        });
     }
+    KGLogAlways(@"hidden collection cell by text: %ld-%ld",
+                (long)indexPath.section, (long)indexPath.item);
 }
 
 static void KGWillDisplayTableCell(id self, SEL _cmd, UITableView *tableView,
                                    UITableViewCell *cell, NSIndexPath *indexPath) {
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, tableView, cell, indexPath); }
-    if (KGViewTextMatches(cell, 0)) {
-        KGHideView(cell);
-        KGLogAlways(@"hidden table cell by text: %ld-%ld",
-                    (long)indexPath.section, (long)indexPath.row);
+    if (!KGViewTextMatches(cell, 0)) { return; }
+
+    KGHideView(cell);
+    BOOL fresh = KGMarkHiddenPath(tableView, indexPath.section, indexPath.row);
+    if (fresh) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [tableView reloadData];
+        });
     }
+    KGLogAlways(@"hidden table cell by text: %ld-%ld",
+                (long)indexPath.section, (long)indexPath.row);
 }
 
 static void KGWillDisplaySupplementary(id self, SEL _cmd, UICollectionView *collectionView,
@@ -272,6 +308,24 @@ static void KGWillDisplayTableHeader(id self, SEL _cmd, UITableView *tableView,
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, NSInteger))original)(self, _cmd, tableView, view, section); }
     if (KGViewTextMatches(view, 0)) { KGHideView(view); }
+}
+
+typedef CGSize (*KGSizeIMP)(id, SEL, id, id, id);
+typedef CGFloat (*KGHeightIMP)(id, SEL, id, id);
+
+static CGSize KGSizeForItem(id self, SEL _cmd, UICollectionView *collectionView,
+                            UICollectionViewLayout *layout, NSIndexPath *indexPath) {
+    if (KGIsHiddenPath(collectionView, indexPath.section, indexPath.item)) { return CGSizeZero; }
+    IMP original = KGCurrentOriginalIMP(self, _cmd);
+    if (original) { return ((KGSizeIMP)original)(self, _cmd, collectionView, layout, indexPath); }
+    return CGSizeMake(1.0, 1.0);
+}
+
+static CGFloat KGHeightForRow(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
+    if (KGIsHiddenPath(tableView, indexPath.section, indexPath.row)) { return 0.0; }
+    IMP original = KGCurrentOriginalIMP(self, _cmd);
+    if (original) { return ((KGHeightIMP)original)(self, _cmd, tableView, indexPath); }
+    return 0.0;
 }
 
 /* ============ hook 注册表 ============ */
@@ -488,7 +542,14 @@ static KGSelHook kSelHooks[] = {
     {"refreshBottomTaskCenterView:", (IMP)KGNoopNil},
     {"setBottomTaskCenterView:", (IMP)KGNoop},
     /* v9d: 不再置空 earnMoneyUrlStr —— 会让赚钱页 URL=nil 一直转圈。
-     * 入口改由文字识别 + 类级 layoutSubviews 隐藏，视觉上直接不显示。 */
+     * v9f: 赚钱入口不走 willDisplay 路径，改拦任务入口 view 的
+     * 真实显示/点击方法（showTaskView / clickTaskView 等），
+     * 入口根本不显示，自然点不进去。 */
+    {"showTaskView", (IMP)KGNoopNil},
+    {"clickTaskView", (IMP)KGNoopNil},
+    {"checkShowTaskView", (IMP)KGNoopNil},
+    {"checkTaskViewShowBI", (IMP)KGNoopNil},
+    {"setTaskView:", (IMP)KGNoop},
 };
 static const NSUInteger kSelHookCount = sizeof(kSelHooks) / sizeof(kSelHooks[0]);
 
@@ -499,6 +560,9 @@ static KGSelHook kPreserveSelHooks[] = {
     {"collectionView:willDisplaySupplementaryView:forElementKind:atIndexPath:", (IMP)KGWillDisplaySupplementary},
     {"tableView:willDisplayHeaderView:forSection:", (IMP)KGWillDisplayTableHeader},
     {"tableView:willDisplayFooterView:forSection:", (IMP)KGWillDisplayTableHeader},
+    {"collectionView:layout:sizeForItemAtIndexPath:", (IMP)KGSizeForItem},
+    {"tableView:heightForRowAtIndexPath:", (IMP)KGHeightForRow},
+    {"tableView:estimatedHeightForRowAtIndexPath:", (IMP)KGHeightForRow},
 };
 static const NSUInteger kPreserveSelHookCount = sizeof(kPreserveSelHooks) / sizeof(kPreserveSelHooks[0]);
 
