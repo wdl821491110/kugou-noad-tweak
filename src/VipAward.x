@@ -180,7 +180,6 @@ static void KGObserveURL(NSString *url, NSString *saltHint) {
 // 优先用从 App 自身签名链路观测到的配置（salt/appid/clientver/dfid/mid）
 static NSString *KGCurSalt(void) { return (KGAppSalt.length >= 16) ? KGAppSalt : KG_SALT; }
 static NSString *KGCurAppid(void) { return KGAppAppid.length ? KGAppAppid : KG_APPID; }
-static NSString *KGCurCver(void) { return KGAppClientver.length ? KGAppClientver : KG_CLIENTVER; }
 static NSString *KGCurDfid(void) { return KGAppDfid.length ? KGAppDfid : @"-"; }
 static NSString *KGCurMid(void) { return KGAppMid.length ? KGAppMid : KG_MID; }
 
