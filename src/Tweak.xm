@@ -24,6 +24,13 @@
  *     * 赚钱入口：补拦 needRefreshTaskCenterEntrance 等数据判定。
  *     * 6 卡片：不再拦 banner 数据源（走的是推荐流原生 cell），改为运行时
  *       按类名 hook 这些 cell 的 layoutSubviews 隐藏自身。
+ *  - v9：v8 仍漏两张卡且隐藏后留大片空白，修正方向：
+ *     * 识别：按 cell 内 UILabel / accessibilityLabel 文字命中标题关键词，
+ *       不再只靠类名（「喜欢 X 的 TA 也喜欢」「概念er新推」的类名猜错）。
+ *     * 高度：记录命中的 collectionView / indexPath，hook sizeForItem 与
+ *       heightForRow 返回 0，并 invalidateLayout，空白随卡片一起消失。
+ *     * 重试：cell 类可能在用户首次进发现页才注册，加 1 秒 × 180 次重试。
+ *     * 赚钱：补拦 taskCenterButtonClick / p_btnTaskCenterAction 等真实点击。
  */
 
 @import Foundation;
@@ -41,64 +48,198 @@
 
 typedef void (^KGSuccessCB)(id);
 
-/* ============ v8: 首页 6 个运营卡片 cell 运行时隐藏 ============
- * 这些卡片是首页推荐流里的原生 UICollectionViewCell，不走 banner 数据源。
- * 静态解析拿不到它们的 method list，改为运行时按类名拿到类，
- * 替换 layoutSubviews：隐藏自身，让卡片视觉消失。不调用原实现 =
- * 内部 subview 不再布局渲染，但 cell 仍占位（不会崩，这是最安全档位）。 */
+/* ============ v9: 运行时状态 / 通用工具 ============
+ * 1) 保存被替换方法的原始 IMP，便于「先调用原实现，再判断是否隐藏」；
+ * 2) 记录命中关键词的 indexPath，供 sizeForItem / heightForRow 归零；
+ * 3) 按 cell 内文字识别，避免类名猜错。 */
+static NSMutableDictionary *KGOriginalIMPs = nil;
+static NSMutableSet *KGHiddenPaths = nil;
+static NSArray *KGHideKeywords = nil;
+
+static void KGInitRuntimeState(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        KGOriginalIMPs = [NSMutableDictionary dictionary];
+        KGHiddenPaths = [NSMutableSet set];
+        KGHideKeywords = @[
+            @"TA也喜欢", @"ta也喜欢", @"TA特喜欢", @"ta特喜欢",
+            @"概念er新推", @"概念实验室", @"曲风盲盒", @"VIP专属", @"小众宝藏",
+            @"赚钱", @"赚金币", @"赚概念币", @"任务中心"
+        ];
+    });
+}
+
+static void KGStoreOriginalIMP(Method m) {
+    KGInitRuntimeState();
+    if (!m) { return; }
+    NSValue *key = [NSValue valueWithPointer:(void *)m];
+    if (KGOriginalIMPs[key]) { return; }
+    IMP original = method_getImplementation(m);
+    if (original) { KGOriginalIMPs[key] = [NSValue valueWithPointer:(void *)original]; }
+}
+
+static IMP KGOriginalIMP(Method m) {
+    KGInitRuntimeState();
+    if (!m) { return NULL; }
+    NSValue *value = KGOriginalIMPs[[NSValue valueWithPointer:(void *)m]];
+    return value ? (IMP)[value pointerValue] : NULL;
+}
+
+static BOOL KGTextMatches(NSString *text) {
+    if (text.length == 0) { return NO; }
+    for (NSString *keyword in KGHideKeywords) {
+        if ([text rangeOfString:keyword options:(NSCaseInsensitiveSearch | NSLiteralSearch)].location != NSNotFound) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL KGViewTextMatches(UIView *view, NSInteger depth) {
+    if (!view || depth > 12) { return NO; }
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        if (KGTextMatches(label.text) || KGTextMatches(label.attributedText.string)) { return YES; }
+    }
+    if ([view isKindOfClass:[UIButton class]]) {
+        UIButton *button = (UIButton *)view;
+        if (KGTextMatches(button.titleLabel.text)) { return YES; }
+    }
+    if (KGTextMatches(view.accessibilityLabel)) { return YES; }
+    for (UIView *subview in view.subviews) {
+        if (KGViewTextMatches(subview, depth + 1)) { return YES; }
+    }
+    return NO;
+}
+
+static void KGHideView(UIView *view) {
+    if (view.hidden != YES) { view.hidden = YES; }
+    if (view.alpha != 0.0) { view.alpha = 0.0; }
+}
+
+static NSString *KGPathKey(id container, NSInteger section, NSInteger index) {
+    return [NSString stringWithFormat:@"%p-%ld-%ld", (__bridge void *)container, (long)section, (long)index];
+}
+
+static BOOL KGIsHiddenPath(id container, NSInteger section, NSInteger index) {
+    KGInitRuntimeState();
+    return [KGHiddenPaths containsObject:KGPathKey(container, section, index)];
+}
+
+static BOOL KGMarkHiddenPath(id container, NSInteger section, NSInteger index) {
+    KGInitRuntimeState();
+    NSString *key = KGPathKey(container, section, index);
+    if ([KGHiddenPaths containsObject:key]) { return NO; }
+    [KGHiddenPaths addObject:key];
+    return YES;
+}
+
+/* ============ v8/v9: 首页运营卡片 + 任务入口 view 运行时隐藏 ============
+ * v8：按类名 hook layoutSubviews 让 cell 自身隐藏。
+ * v9：额外 hook preferredLayoutAttributesFittingAttributes: 返回 zero size，
+ *     只改本类方法，绝不碰父类，避免误伤普通歌曲 cell。 */
 static void KGHiddenLayout(id self, SEL _cmd) {
-    UIView *v = (UIView *)self;
-    if (v.hidden != YES) { v.hidden = YES; }
-    if (v.alpha != 0.0) { v.alpha = 0.0; }
+    KGHideView((UIView *)self);
+}
+
+static UICollectionViewLayoutAttributes *KGHiddenFitting(id self, SEL _cmd, UICollectionViewLayoutAttributes *attributes) {
+    UICollectionViewLayoutAttributes *result = [attributes copy];
+    if (!result) { result = [UICollectionViewLayoutAttributes new]; }
+    result.size = CGSizeZero;
+    result.hidden = YES;
+    result.alpha = 0.0;
+    return result;
+}
+
+/* 只给「本类」安装方法：绝不用 class_getInstanceMethod（会沿继承链拿到父类实现） */
+static BOOL KGInstallOwnMethod(Class cls, SEL sel, IMP imp, const char *types) {
+    if (class_addMethod(cls, sel, imp, types)) { return YES; }
+    unsigned int count = 0;
+    Method *list = class_copyMethodList(cls, &count);
+    BOOL done = NO;
+    for (unsigned int i = 0; i < count; i++) {
+        if (sel_isEqual(method_getName(list[i]), sel)) {
+            method_setImplementation(list[i], imp);
+            done = YES;
+            break;
+        }
+    }
+    free(list);
+    return done;
 }
 
 static void KGInstallCardCellHooks(void) {
-    /* 概念实验室 / 曲风盲盒 / VIP专属推荐 / 小众宝藏 / 喜欢 ta 特喜欢 / 概念er新推 */
     static const char *names[] = {
         "KGYouthNewDiscoverConceptLabV5Cell",
         "KGYouthNewDiscoverNicheRecV5Cell",
         "KGYouthNewDiscoverVipRecV5Cell",
         "KGYouthNewDiscoverDifTagRecV5Cell",
+        "KGYouthNewDiscoverTagRecV5Cell",
+        "KGYouthNewDiscoverTagRecItemV5Cell",
+        "KGYouthNewDiscoverTagRecIpadV5Cell",
+        "KGYouthNewDiscoverHotRecV5Cell",
+        "KGYouthNewDiscoverAdV5Cell",
+        "KGYouthNewDiscoverAdItemV5Cell",
+        "KGYouthNewDiscoverAdOperItemV5Cell",
+        "KGYouthNewDiscoverUniAdItemV5Cell",
+        "KGYouthNewDiscoverCardAdItemV5Cell",
         "KGYouthNewDiscoverCardAdV5View",
         "KGYouthNewDiscoverCardAdView",
+        "KGYouthNewDiscoverAdBannerCollectionCell",
+        "YouthDiscoverTmeMaskAdV5Cell",
+        "YouthDiscoverTmeWaistAdV5Cell",
         "YouthNewDiscoverConceptLabItemBaseCell",
         "YouthNewDiscoverDifTagRecItemBaseCell",
+        "YouthNewDiscoverDifTagRecItemBigCell",
+        "YouthNewDiscoverDifTagRecItemSmallCell",
+        "YouthNewDiscoverDifTagRecItemSmallSongTableCell",
+        "KGYouthNewDiscoverVipRecItemV5Cell",
+        "KGYouthNewDiscoverNicheRecItemV5Cell",
+        "KGYouthMineHeaderTaskView",
+        "KGYouthMineTaskCenterView",
+        "YouthMineFreeReceiveTaskBarView",
         NULL
     };
-    static BOOL installed[16] = { NO };
+    static BOOL installed[32] = { NO };
     SEL layoutSel = @selector(layoutSubviews);
+    SEL fittingSel = @selector(preferredLayoutAttributesFittingAttributes:);
 
-    /* 不用 dispatch_once：cell 类可能启动晚期才注册，每次 tick 重试未装上的 */
-    for (int i = 0; names[i] && i < 16; i++) {
+    for (int i = 0; names[i] && i < 32; i++) {
         if (installed[i]) { continue; }
         Class cls = objc_getClass(names[i]);
-        if (!cls) { continue; }   // 还没注册，下次再试
+        if (!cls) { continue; }   // 类还没注册，下一秒再试
 
-        /* 关键：绝不能用 class_getInstanceMethod，它会沿继承链拿到父类
-         * (UICollectionViewCell) 的 layoutSubviews，替换后会隐藏所有 cell。
-         * 先 class_addMethod 给本类加自己的实现（不碰父类）；
-         * 若本类已有自己的实现（add 失败），再只在本类 method list 内替换。 */
-        BOOL added = class_addMethod(cls, layoutSel, (IMP)KGHiddenLayout, "v@:");
-        if (added) {
+        BOOL a = KGInstallOwnMethod(cls, layoutSel, (IMP)KGHiddenLayout, "v@:");
+        BOOL b = KGInstallOwnMethod(cls, fittingSel, (IMP)KGHiddenFitting, "@:@");
+        if (a || b) {
             installed[i] = YES;
-            KGLogAlways(@"added hidden layout to: %s", names[i]);
+            KGLogAlways(@"hidden hooks installed: %s", names[i]);
         } else {
-            unsigned int mc = 0;
-            Method *mlist = class_copyMethodList(cls, &mc);
-            BOOL done = NO;
-            for (unsigned int k = 0; k < mc; k++) {
-                if (sel_isEqual(method_getName(mlist[k]), layoutSel)) {
-                    method_setImplementation(mlist[k], (IMP)KGHiddenLayout);
-                    installed[i] = YES;
-                    KGLogAlways(@"replaced own layout on: %s", names[i]);
-                    done = YES;
-                    break;
-                }
-            }
-            free(mlist);
-            if (!done) { KGLogAlways(@"cannot hook layout on: %s", names[i]); }
+            KGLogAlways(@"cannot hook: %s", names[i]);
         }
     }
+}
+
+/* v9：类常在用户首次进发现页时才注册，6 次时机不够，补 1 秒 × 180 次重试 */
+static NSTimer *KGCardHookTimer = nil;
+static NSInteger KGCardHookTicks = 0;
+static void KGStartCardHookTimer(void) {
+    KGInstallCardCellHooks();
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        KGCardHookTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                           repeats:YES
+                                                             block:^(NSTimer *timer) {
+            KGInstallCardCellHooks();
+            if (++KGCardHookTicks >= 180) {
+                [timer invalidate];
+                KGCardHookTimer = nil;
+            }
+        }];
+        if (KGCardHookTimer) {
+            [[NSRunLoop mainRunLoop] addTimer:KGCardHookTimer forMode:NSRunLoopCommonModes];
+        }
+    });
 }
 
 static void KGCallCB(id cb) {
@@ -118,6 +259,81 @@ static void KGNoop_CB3(id self, SEL _cmd, id a, id success, id error) { KGCallCB
 static void KGNoop_CB3Bool(id self, SEL _cmd, BOOL a, id success, id error) { KGCallCB(success); }
 static void KGNoop_CB4Bool(id self, SEL _cmd, BOOL a, id b, id success, id error) { KGCallCB(success); }
 static void KGNoop_CB4Id(id self, SEL _cmd, id a, id b, id success, id error) { KGCallCB(success); }
+
+/* ============ v9: 按文字隐藏 + 高度归零（保留原实现） ============
+ * 这些 hook 不能置空原实现：先调用 original，再按 cell 内文字判断。
+ * 原始 IMP 在 KGInstallSelectorHooks 替换前存进 KGOriginalIMPs。 */
+typedef CGSize (*KGSizeIMP)(id, SEL, id, id, id);
+typedef CGFloat (*KGHeightIMP)(id, SEL, id, id);
+
+static IMP KGCurrentOriginalIMP(id self, SEL sel) {
+    return KGOriginalIMP(class_getInstanceMethod(object_getClass(self), sel));
+}
+
+static void KGWillDisplayCollectionCell(id self, SEL _cmd, UICollectionView *collectionView,
+                                        UICollectionViewCell *cell, NSIndexPath *indexPath) {
+    IMP original = KGCurrentOriginalIMP(self, _cmd);
+    if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, collectionView, cell, indexPath); }
+    if (!KGViewTextMatches(cell, 0)) { return; }
+
+    KGHideView(cell);
+    NSInteger index = indexPath.item;
+    BOOL fresh = KGMarkHiddenPath(collectionView, indexPath.section, index);
+    if (fresh) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [collectionView.collectionViewLayout invalidateLayout];
+        });
+    }
+    KGLogAlways(@"hidden collection cell by text: %ld-%ld", (long)indexPath.section, (long)index);
+}
+
+static void KGWillDisplayTableCell(id self, SEL _cmd, UITableView *tableView,
+                                   UITableViewCell *cell, NSIndexPath *indexPath) {
+    IMP original = KGCurrentOriginalIMP(self, _cmd);
+    if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, tableView, cell, indexPath); }
+    if (!KGViewTextMatches(cell, 0)) { return; }
+
+    KGHideView(cell);
+    NSInteger index = indexPath.row;
+    BOOL fresh = KGMarkHiddenPath(tableView, indexPath.section, index);
+    if (fresh) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [tableView reloadData];
+        });
+    }
+    KGLogAlways(@"hidden table cell by text: %ld-%ld", (long)indexPath.section, (long)index);
+}
+
+static void KGWillDisplaySupplementary(id self, SEL _cmd, UICollectionView *collectionView,
+                                       UIView *view, NSString *kind, NSIndexPath *indexPath) {
+    IMP original = KGCurrentOriginalIMP(self, _cmd);
+    if (original) { ((void (*)(id, SEL, id, id, id, id))original)(self, _cmd, collectionView, view, kind, indexPath); }
+    if (KGViewTextMatches(view, 0)) { KGHideView(view); }
+}
+
+static void KGWillDisplayTableHeader(id self, SEL _cmd, UITableView *tableView,
+                                     UIView *view, NSInteger section) {
+    IMP original = KGCurrentOriginalIMP(self, _cmd);
+    if (original) { ((void (*)(id, SEL, id, id, NSInteger))original)(self, _cmd, tableView, view, section); }
+    if (KGViewTextMatches(view, 0)) { KGHideView(view); }
+}
+
+static CGSize KGSizeForItem(id self, SEL _cmd, UICollectionView *collectionView,
+                            UICollectionViewLayout *layout, NSIndexPath *indexPath) {
+    NSInteger index = indexPath.item;
+    if (KGIsHiddenPath(collectionView, indexPath.section, index)) { return CGSizeZero; }
+    IMP original = KGCurrentOriginalIMP(self, _cmd);
+    if (original) { return ((KGSizeIMP)original)(self, _cmd, collectionView, layout, indexPath); }
+    return CGSizeMake(1.0, 1.0);
+}
+
+static CGFloat KGHeightForRow(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
+    NSInteger index = indexPath.row;
+    if (KGIsHiddenPath(tableView, indexPath.section, index)) { return 0.0; }
+    IMP original = KGCurrentOriginalIMP(self, _cmd);
+    if (original) { return ((KGHeightIMP)original)(self, _cmd, tableView, indexPath); }
+    return 0.0;
+}
 
 /* ============ hook 注册表 ============ */
 typedef struct {
@@ -323,31 +539,61 @@ static KGSelHook kSelHooks[] = {
     {"needRefreshTaskCenterEntrance", (IMP)KGNoopNil},
     {"mineTaskCenterReadPointShow", (IMP)KGNoopNil},
     {"checkCanShowMyPageTaskCenterSignIn", (IMP)KGNoopNil},
+
+    /* v9: 赚钱入口的真实点击方法（v7/v8 只拦跳转与数据判定，入口仍能点进去） */
+    {"taskCenterButtonClick", (IMP)KGNoopNil},
+    {"p_btnTaskCenterAction", (IMP)KGNoopNil},
+    {"clickWithTaskCenter:", (IMP)KGNoopNil},
+    {"goToTaskCenterWithSourceId:actionType:taskId:animated:", (IMP)KGNoopNil},
+    {"goToTaskCenterWithSourceId:actionType:taskId:giftId:animated:", (IMP)KGNoopNil},
+    {"refreshBottomTaskCenterView:", (IMP)KGNoopNil},
+    {"setBottomTaskCenterView:", (IMP)KGNoop},
+    {"earnMoneyUrlStr", (IMP)KGNoopNil},
 };
 static const NSUInteger kSelHookCount = sizeof(kSelHooks) / sizeof(kSelHooks[0]);
 
-static void KGInstallSelectorHooks(void) {
-    static NSMutableSet *hookedMethods = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ hookedMethods = [NSMutableSet set]; });
+/* v9: 这些 hook 必须先调用原实现，不能置空。替换前保存 original IMP。 */
+static KGSelHook kPreserveSelHooks[] = {
+    {"collectionView:willDisplayCell:forItemAtIndexPath:", (IMP)KGWillDisplayCollectionCell},
+    {"tableView:willDisplayCell:forRowAtIndexPath:", (IMP)KGWillDisplayTableCell},
+    {"collectionView:willDisplaySupplementaryView:forElementKind:atIndexPath:", (IMP)KGWillDisplaySupplementary},
+    {"tableView:willDisplayHeaderView:forSection:", (IMP)KGWillDisplayTableHeader},
+    {"tableView:willDisplayFooterView:forSection:", (IMP)KGWillDisplayTableHeader},
+    {"collectionView:layout:sizeForItemAtIndexPath:", (IMP)KGSizeForItem},
+    {"tableView:heightForRowAtIndexPath:", (IMP)KGHeightForRow},
+    {"tableView:estimatedHeightForRowAtIndexPath:", (IMP)KGHeightForRow},
+};
+static const NSUInteger kPreserveSelHookCount = sizeof(kPreserveSelHooks) / sizeof(kPreserveSelHooks[0]);
 
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
+static void KGInstallSelHookList(KGSelHook *list, NSUInteger listCount, NSMutableSet *hookedMethods) {
+    unsigned int classCount = 0;
+    Class *classes = objc_copyClassList(&classCount);
     if (!classes) { return; }
-    for (unsigned int i = 0; i < count; i++) {
+    for (unsigned int i = 0; i < classCount; i++) {
         Class cls = classes[i];
-        for (NSUInteger j = 0; j < kSelHookCount; j++) {
-            SEL sel = sel_registerName(kSelHooks[j].sel);
+        for (NSUInteger j = 0; j < listCount; j++) {
+            SEL sel = sel_registerName(list[j].sel);
             Method m = class_getInstanceMethod(cls, sel);
             if (!m) { continue; }
             NSValue *key = [NSValue valueWithPointer:(void *)m];
             if ([hookedMethods containsObject:key]) { continue; }
             [hookedMethods addObject:key];
-            method_setImplementation(m, kSelHooks[j].imp);
-            KGLog(@"global hooked %s on %@", kSelHooks[j].sel, NSStringFromClass(cls));
+            KGStoreOriginalIMP(m);
+            method_setImplementation(m, list[j].imp);
+            KGLog(@"global hooked %s on %@", list[j].sel, NSStringFromClass(cls));
         }
     }
     free(classes);
+}
+
+static void KGInstallSelectorHooks(void) {
+    KGInitRuntimeState();
+    static NSMutableSet *hookedMethods = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ hookedMethods = [NSMutableSet set]; });
+
+    KGInstallSelHookList(kSelHooks, kSelHookCount, hookedMethods);
+    KGInstallSelHookList(kPreserveSelHooks, kPreserveSelHookCount, hookedMethods);
 }
 
 static void KGInstallAllHooks(void) {
@@ -373,7 +619,7 @@ static void KGInstallAllHooks(void) {
     /* A+C：弹窗调度层全局 selector 挂载 */
     KGInstallSelectorHooks();
 
-    /* v8：首页 6 个运营卡片 cell 运行时隐藏 */
+    /* v8/v9：首页运营卡片 cell 运行时隐藏（定时器在 %ctor 里启动） */
     KGInstallCardCellHooks();
 }
 
@@ -383,9 +629,10 @@ static void KGInstallAllHooks(void) {
     /* 1. 立刻挂一次（类已在内存时直接生效） */
     KGInstallAllHooks();
 
-    /* 2. 主线程下一个 loop 再挂（覆盖 guest App 刚 dlopen 的情况） */
+    /* 2. 主线程下一个 loop 再挂（覆盖 guest App 刚 dlopen 的情况），并启动 cell hook 重试定时器 */
     dispatch_async(dispatch_get_main_queue(), ^{
         KGInstallAllHooks();
+        KGStartCardHookTimer();
     });
 
     /* 3. App 启动完成时再挂一次 */

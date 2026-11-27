@@ -31,18 +31,18 @@ jobs:
           cd $GITHUB_WORKSPACE
           make clean || true
           make -j2 DEBUG=0
-          find . -name "*.dylib" -exec ls -la {} \;
+          ls -la .theos/obj/
 
       - name: Collect artifacts
         run: |
           mkdir -p $GITHUB_WORKSPACE/out
-          # release 构建：唯一产物在 .theos/obj/kugou_noad_v8.dylib
-          cp .theos/obj/kugou_noad_v8.dylib $GITHUB_WORKSPACE/out/
+          # release 构建：唯一产物在 .theos/obj/kugou_noad_v9.dylib
+          cp .theos/obj/kugou_noad_v9.dylib $GITHUB_WORKSPACE/out/
           ls -la $GITHUB_WORKSPACE/out
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KGNoAd
+          name: KGNoAd-v9
           path: out/*
           if-no-files-found: error
