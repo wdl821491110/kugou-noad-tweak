@@ -44,3 +44,13 @@ jobs:
           name: KGNoAd
           path: out/*
           if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: KGNoAd v1.0.0
+          files: out/*
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
