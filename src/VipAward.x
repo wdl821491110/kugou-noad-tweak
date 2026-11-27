@@ -10,7 +10,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 
-#define KG_VER   @"v16"
+#define KG_VER   @"v16b"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"
@@ -144,6 +144,7 @@ static NSString *KGReplayQuery = nil;
 static NSDictionary *KGReplayHeaders = nil;
 static NSTimeInterval KGReplayAt = 0;
 static int KGReplayParamCount = 0;
+static NSString *KGReplayAppid = nil;
 static NSObject *KGReplayLock = nil;
 
 static void KGReplayLockInit(void) {
@@ -213,9 +214,43 @@ static BOOL KGIsStdSignedQuery(NSDictionary *p) {
     return YES;
 }
 
+// v16b：只采集 App 自己构造的请求头（kg-* 等），用于复用时原样带上
+static void KGCaptureHeaders(NSString *url, id reqObj) {
+    if (![url containsString:@"gateway.kugou.com"]) { return; }
+    NSDictionary *hf = nil;
+    @try {
+        if ([reqObj isKindOfClass:NSURLRequest.class]) {
+            hf = [(NSURLRequest *)reqObj allHTTPHeaderFields];
+        }
+    } @catch (__unused NSException *ex) {}
+    if (![hf isKindOfClass:NSDictionary.class] || hf.count == 0) { return; }
+    NSMutableDictionary *keep = [NSMutableDictionary dictionary];
+    for (NSString *k in hf) {
+        if (![k isKindOfClass:NSString.class]) { continue; }
+        NSString *lk = [k lowercaseString];
+        BOOL want = [lk hasPrefix:@"kg-"] || [lk isEqualToString:@"user-agent"] ||
+                    [lk isEqualToString:@"dfid"] || [lk isEqualToString:@"mid"] ||
+                    [lk isEqualToString:@"clienttime"];
+        if (!want) { continue; }
+        NSString *v = KGStr(hf[k]);
+        if (v.length && v.length < 300) { keep[k] = v; }
+    }
+    if (keep.count == 0) { return; }
+    KGReplayLockInit();
+    @synchronized (KGReplayLock) { KGReplayHeaders = [keep copy]; }
+}
+
 static void KGReplayConsider(NSString *url, NSDictionary *p) {
     if (![url containsString:@"/youth/"]) { return; }
     if (!KGIsStdSignedQuery(p)) { return; }
+    // v16b 关键：排除本 dylib 自己算的签名。否则 3116 口径的废签名会被当成素材，
+    // 之后每次复用都必然 51002，永远翻不了身。
+    {
+        NSString *sig = KGStr(p[@"signature"]);
+        NSMutableDictionary *qp = [NSMutableDictionary dictionaryWithDictionary:p];
+        [qp removeObjectForKey:@"signature"];
+        if ([[KGSign(qp) lowercaseString] isEqualToString:[sig lowercaseString]]) { return; }
+    }
     NSRange qr = [url rangeOfString:@"?"];
     if (qr.location == NSNotFound) { return; }
     NSString *q = [url substringFromIndex:qr.location + 1];
@@ -228,6 +263,7 @@ static void KGReplayConsider(NSString *url, NSDictionary *p) {
         if (fresh && (int)p.count >= KGReplayParamCount) { return; }   // 60 秒内只接受更精简的
         KGReplayQuery = [q copy];
         KGReplayParamCount = (int)p.count;
+        KGReplayAppid = [KGStr(p[@"appid"]) copy];
         KGReplayAt = [NSDate date].timeIntervalSince1970;
     }
 }
@@ -355,11 +391,17 @@ static void KGWriteDiag(NSString *extra) {
     {
         NSTimeInterval rat = 0;
         NSUInteger qlen = 0;
+        NSString *rap = nil;
+        NSUInteger hcnt = 0;
         KGReplayLockInit();
-        @synchronized (KGReplayLock) { rat = KGReplayAt; qlen = KGReplayQuery.length; }
+        @synchronized (KGReplayLock) {
+            rat = KGReplayAt; qlen = KGReplayQuery.length;
+            rap = [KGReplayAppid copy]; hcnt = KGReplayHeaders.count;
+        }
         double age = rat > 0 ? ([NSDate date].timeIntervalSince1970 - rat) : -1;
-        [s appendFormat:@"replay: ready=%@ age=%.0fs qlen=%lu\n",
-            KGReplayReady()?@"YES":@"NO", age, (unsigned long)qlen];
+        [s appendFormat:@"replay: ready=%@ age=%.0fs qlen=%lu appid=%@ hdr=%lu\n",
+            KGReplayReady()?@"YES":@"NO", age, (unsigned long)qlen,
+            rap.length ? rap : @"-", (unsigned long)hcnt];
     }
     // v15：App 自己发出的 youth 请求原始 URL（含 signature），用于反推 appid=3114 的 salt
     @synchronized (KGRawReqs) {
@@ -745,7 +787,8 @@ static BOOL KGReplayReady(void) {
     return ok;
 }
 
-static void KGReplayPost(NSString *path, void (^done)(NSDictionary *json, NSError *err)) {
+static void KGReplaySend(NSString *path, NSString *method,
+                         void (^done)(NSDictionary *json, NSError *err)) {
     KGReplayLockInit();
     NSString *q = nil;
     NSDictionary *hd = nil;
@@ -760,15 +803,17 @@ static void KGReplayPost(NSString *path, void (^done)(NSDictionary *json, NSErro
     NSString *url = [NSString stringWithFormat:@"https://gateway.kugou.com%@?%@", path, q];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
     objc_setAssociatedObject(req, &kKGOurReqKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    req.HTTPMethod = @"POST";
-    req.HTTPBody = [NSData data];
+    req.HTTPMethod = method;
+    if (![method isEqualToString:@"GET"]) { req.HTTPBody = [NSData data]; }
     for (NSString *k in hd) {
         if (![k isKindOfClass:NSString.class]) { continue; }
         NSString *v = KGStr(hd[k]);
         if (k.length && v.length) { [req setValue:v forHTTPHeaderField:k]; }
     }
     if (![req valueForHTTPHeaderField:@"User-Agent"]) { [req setValue:KG_UA forHTTPHeaderField:@"User-Agent"]; }
-    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    if (![method isEqualToString:@"GET"]) {
+        [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    }
     req.timeoutInterval = 15;
 
     NSURLSession *s = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration];
@@ -781,8 +826,18 @@ static void KGReplayPost(NSString *path, void (^done)(NSDictionary *json, NSErro
     [t resume];
 }
 
+static void KGReplayPost(NSString *path, void (^done)(NSDictionary *json, NSError *err)) {
+    KGReplaySend(path, @"POST", done);
+}
+
+static void KGReplayGet(NSString *path, void (^done)(NSDictionary *json, NSError *err)) {
+    KGReplaySend(path, @"GET", done);
+}
+
 static void KGGet(NSString *path, NSMutableDictionary *params,
                   void (^done)(NSDictionary *json, NSError *err)) {
+    // v16b：GET 也优先复用 App 的签名（签名与 path 无关，实测可换 path）
+    if (KGReplayReady()) { KGReplayGet(path, done); return; }
     params[@"dfid"] = KGCurDfid();
     params[@"uuid"] = @"-";
     params[@"mid"] = KGCurMid();
@@ -1532,7 +1587,7 @@ static void KGInstallHooksOnce(void) {
                     if ([r isKindOfClass:NSURL.class]) {
                         NSString *u = [(NSURL *)r absoluteString];
                         BOOL ours = (objc_getAssociatedObject(self, &kKGOurReqKey) != nil);
-                        if (!ours) { KGRawCapture(u); }
+                        if (!ours) { KGRawCapture(u); KGCaptureHeaders(u, self); }
                         static int budget = 0;
                         if (budget < 6000) { budget++; KGOnURLSeen(u); }
                     }
