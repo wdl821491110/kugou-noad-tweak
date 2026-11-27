@@ -9,7 +9,7 @@
 #import <objc/message.h>
 #import <CommonCrypto/CommonDigest.h>
 
-#define KG_VER   @"v10"
+#define KG_VER   @"v11"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"
@@ -36,6 +36,7 @@ static id KGLastEnv = nil;
 static BOOL H_Login = NO, H_EnvInit = NO, H_EnvTok = NO, H_AF = NO, H_Common = NO, H_Res = NO;
 static NSString *KGProbeReport = @"";
 static NSString *KGTokenTestReport = @"";
+static NSString *KGAPITestReport = @"";
 static NSMutableArray *KGReqLog = nil;   // App 自身请求 URL（脱敏）
 
 // ---------- 工具 ----------
@@ -163,11 +164,27 @@ static void KGWriteDiag(NSString *extra) {
     [s appendFormat:@"probe:\n%@", KGProbeReport.length ? KGProbeReport : @"(未运行)\n"];
     // 候选 token 实打测试结果
     [s appendFormat:@"tokentest:\n%@", KGTokenTestReport.length ? KGTokenTestReport : @"(未运行)\n"];
+    // App 内真实接口探测（哪个接口认这个 token）
+    [s appendFormat:@"apiprobe:\n%@", KGAPITestReport.length ? KGAPITestReport : @"(未运行)\n"];
     // App 自身请求（脱敏，证明真实接口地址/参数）
     [s appendString:@"appreq:\n"];
     if (KGReqLog.count == 0) { [s appendString:@"(无)\n"]; }
     else {
         for (NSString *l in KGReqLog) { [s appendFormat:@"  %@\n", l]; }
+    }
+    // UserDefaults 里可能的凭据载体（脱敏）
+    [s appendString:@"uddump:\n"];
+    for (NSString *k in @[@"lastStartToken", @"YouthUserStateInfoKey"]) {
+        id v = [[NSUserDefaults standardUserDefaults] objectForKey:k];
+        if (!v) { [s appendFormat:@"  %@: (nil)\n", k]; continue; }
+        NSString *desc = nil;
+        if ([v isKindOfClass:NSString.class]) { desc = v; }
+        else if ([v isKindOfClass:NSData.class]) { desc = [NSString stringWithFormat:@"NSData(%lu)", (unsigned long)[v length]]; }
+        else { desc = [NSString stringWithFormat:@"%@ %@", NSStringFromClass([v class]), [v description]]; }
+        if (desc.length > 40) {
+            desc = [NSString stringWithFormat:@"%@..(%lu)", [desc substringToIndex:16], (unsigned long)desc.length];
+        }
+        [s appendFormat:@"  %@: %@\n", k, desc];
     }
     if (extra) { [s appendFormat:@"extra: %@\n", extra]; }
     NSString *p = KG_DIAG_PATH(NSHomeDirectory());
@@ -336,6 +353,117 @@ static void KGPost(NSString *path, NSMutableDictionary *params,
     [t resume];
 }
 
+static void KGGet(NSString *path, NSMutableDictionary *params,
+                  void (^done)(NSDictionary *json, NSError *err)) {
+    params[@"dfid"] = @"-";
+    params[@"uuid"] = @"-";
+    params[@"mid"] = KG_MID;
+    params[@"appid"] = KG_APPID;
+    params[@"clientver"] = KG_CLIENTVER;
+    NSString *ct = [NSString stringWithFormat:@"%d", (int)[NSDate date].timeIntervalSince1970];
+    params[@"clienttime"] = ct;
+    params[@"signature"] = KGSign(params);
+
+    NSMutableArray *qs = [NSMutableArray array];
+    for (NSString *k in params) {
+        [qs addObject:[NSString stringWithFormat:@"%@=%@", k, KGEnc([NSString stringWithFormat:@"%@", params[k]])]];
+    }
+    NSString *url = [NSString stringWithFormat:@"https://gateway.kugou.com%@?%@", path, [qs componentsJoinedByString:@"&"]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
+    req.HTTPMethod = @"GET";
+    [req setValue:KG_UA forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"-" forHTTPHeaderField:@"dfid"];
+    [req setValue:KG_MID forHTTPHeaderField:@"mid"];
+    [req setValue:ct forHTTPHeaderField:@"clienttime"];
+    req.timeoutInterval = 15;
+
+    NSURLSession *s = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration];
+    NSURLSessionDataTask *t = [s dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (e || !d) { done(nil, e); return; }
+        id json = nil;
+        @try { json = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil]; } @catch (__unused NSException *ex) {}
+        done([json isKindOfClass:NSDictionary.class] ? json : nil, nil);
+    }];
+    [t resume];
+}
+
+// ---------- App 内真实接口探测 ----------
+// 概念版二进制里存在的领奖/签到接口（从 IPA 字符串表提取），逐个用当前 token 试探
+static void KGProbeQueue(NSArray *defs, NSUInteger i, NSMutableArray *acc,
+                         NSMutableArray *oks, void (^done)(void)) {
+    if (i >= defs.count) {
+        KGAPITestReport = [acc componentsJoinedByString:@"\n"];
+        done();
+        return;
+    }
+    NSArray *def = defs[i];
+    NSString *method = def[0], *path = def[1];
+    NSMutableDictionary *p = [NSMutableDictionary dictionaryWithDictionary:def[2]];
+    void (^cb)(NSDictionary *, NSError *) = ^(NSDictionary *json, NSError *err) {
+        NSString *line;
+        if (err) {
+            line = [NSString stringWithFormat:@"%@ %@ -> ERR %@", method, path, err.localizedDescription];
+        } else {
+            NSInteger st = [KGStr(json[@"status"]) integerValue];
+            NSString *code = KGStr(json[@"error_code"]);
+            line = [NSString stringWithFormat:@"%@ %@ -> status=%ld code=%@ msg=%@",
+                    method, path, (long)st, code, KGStr(json[@"error_msg"])];
+            if (st == 1 || [code isEqualToString:@"131001"]) {
+                [oks addObject:line];
+                line = [line stringByAppendingString:@"  <== 可用"];
+            }
+        }
+        [acc addObject:line];
+        KGProbeQueue(defs, i + 1, acc, oks, done);
+    };
+    if ([method isEqualToString:@"POST"]) {
+        KGPost(path, p, cb);
+    } else {
+        KGGet(path, p, cb);
+    }
+}
+
+static void KGProbeApis(void (^done)(void)) {
+    static BOOL running = NO;
+    if (running) { if (done) { done(); } return; }
+    running = YES;
+    NSString *token = nil, *uid = nil;
+    @synchronized (KGCreds) { token = KGStr(KGCreds[@"token"]); uid = KGStr(KGCreds[@"userid"]); }
+    if (token.length == 0 || uid.length == 0) {
+        KGAPITestReport = @"(无凭据)";
+        running = NO;
+        if (done) { done(); }
+        return;
+    }
+    NSArray *defs = @[
+        @[@"POST", @"/youth/v1/recharge/receive_vip_listen_song",
+          (@{@"source_id": @"90139", @"receive_day": KGTodayString(), @"token": token, @"userid": uid})],
+        @[@"POST", @"/youth/v1/listen_song/upgrade_vip_reward",
+          (@{@"kugouid": uid, @"ad_type": @"1", @"token": token, @"userid": uid})],
+        @[@"GET", @"/concepts/v1/free_mode/receive_vip_morning",
+          (@{@"token": token, @"userid": uid})],
+        @[@"GET", @"/youth/v1/ad/get_ad_vip_time",
+          (@{@"token": token, @"userid": uid})],
+        @[@"GET", @"/youth/v1/free_package/get_vip_task",
+          (@{@"token": token, @"userid": uid})],
+        @[@"GET", @"/youth/v1/player/get_user_free_info",
+          (@{@"token": token, @"userid": uid})],
+        @[@"GET", @"/youth/v1/account/get_vip_tips",
+          (@{@"token": token, @"userid": uid})],
+        @[@"GET", @"/concepts/v1/recharge/receive_365_welfare",
+          (@{@"token": token, @"userid": uid})],
+    ];
+    NSMutableArray *acc = [NSMutableArray array];
+    NSMutableArray *oks = [NSMutableArray array];
+    KGProbeQueue(defs, 0, acc, oks, ^{
+        running = NO;
+        if (oks.count > 0) {
+            KGVipAlert([NSString stringWithFormat:@"%@接口探测命中 %lu 个(见 diag)", KG_VER, (unsigned long)oks.count]);
+        }
+        if (done) { done(); }
+    });
+}
+
 // ---------- 候选凭据收集（多源） ----------
 static id KGFirstValue(id inst, NSArray *sels) {
     if (!inst) { return nil; }
@@ -384,7 +512,7 @@ static NSMutableArray *KGCollectCandidates(void) {
     if (ktv) {
         KGAddCand(out, @"KTVUserManager",
                   KGFirstValue(ktv, @[@"token", @"getToken"]),
-                  KGFirstValue(ktv, @[@"userId", @"userid", @"kugouId", @"uid", @"getUserId"]));
+                  KGFirstValue(ktv, @[@"userId", @"userid", @"kugouId", @"kugouid", @"uid", @"getUserId", @"getLatestLoginUserId"]));
     }
     @try {
         Class c = objc_getClass("KGHistoryUserTokenManager");
@@ -514,7 +642,12 @@ static void KGDoClaim(void) {
             else if ([em isEqualToString:@"20028"]) { msg = @"账号风控(20028)"; }
             else { msg = [NSString stringWithFormat:@"签到失败 code=%@ status=%@ msg=%@", em, KGStr(json[@"status"]), KGStr(json[@"error_msg"])]; }
         }
-        KGVipAlert([NSString stringWithFormat:@"自动领(%@)：%@", KG_VER, msg]);
+        BOOL kgFail = ([msg hasPrefix:@"签到失败"] || [msg hasPrefix:@"签到网络错误"]);
+        static BOOL kgFailAlerted = NO;
+        if (!kgFail || !kgFailAlerted) {
+            if (kgFail) { kgFailAlerted = YES; }
+            KGVipAlert([NSString stringWithFormat:@"自动领(%@)：%@", KG_VER, msg]);
+        }
         KGWriteDiag(msg);
         if ([msg hasPrefix:@"签到成功"] || [msg isEqualToString:@"今天已签到"]) { KGDoUpgrade(); }
     });
@@ -539,7 +672,12 @@ static void KGDoUpgrade(void) {
             else if ([em isEqualToString:@"20028"]) { msg = @"账号风控(20028)"; }
             else { msg = [NSString stringWithFormat:@"升级失败 code=%@ status=%@ msg=%@", em, KGStr(json[@"status"]), KGStr(json[@"error_msg"])]; }
         }
-        KGVipAlert([NSString stringWithFormat:@"自动领(%@)：%@", KG_VER, msg]);
+        BOOL kgFail = ([msg hasPrefix:@"升级失败"] || [msg hasPrefix:@"升级网络错误"]);
+        static BOOL kgUpFailAlerted = NO;
+        if (!kgFail || !kgUpFailAlerted) {
+            if (kgFail) { kgUpFailAlerted = YES; }
+            KGVipAlert([NSString stringWithFormat:@"自动领(%@)：%@", KG_VER, msg]);
+        }
         KGWriteDiag(msg);
     });
 }
@@ -565,8 +703,14 @@ static void KGAutoClaimTick(BOOL verbose) {
         @synchronized (KGCreds) { token = KGCreds[@"token"]; userid = KGCreds[@"userid"]; }
     }
     if (verbose) {
-        // 45 秒诊断：把所有候选 token 逐个实打一次签到，错误码写进 diag
-        KGRunTokenTests(^{ KGWriteDiag(@"diag-tick(after tokentest)"); });
+        // 45 秒诊断：① 用当前 token 逐个试探 App 内真实领奖接口；② 若无命中再试其它候选 token
+        KGProbeApis(^{
+            if (KGAPITestReport.length && [KGAPITestReport containsString:@"可用"]) {
+                KGWriteDiag(@"diag-tick(apiprobe hit)");
+            } else {
+                KGRunTokenTests(^{ KGWriteDiag(@"diag-tick(after apiprobe+tokentest)"); });
+            }
+        });
     }
     if (token.length > 0 && userid.length > 0) {
         KGDoClaim();
