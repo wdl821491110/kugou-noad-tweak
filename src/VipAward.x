@@ -24,6 +24,7 @@
 
 #define KG_SALT @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
+#define KG_VER @"v3"
 
 static NSMutableDictionary *KGCreds = nil;
 static BOOL KGCredsLoaded = NO;
@@ -355,10 +356,18 @@ static void KGVipInstallEntryHooks(void) {
         KGVipInstallEntryHooks();
     });
 
-    /* 启动确认弹窗（调试版） */
+    /* 启动确认弹窗（调试版，带版本号防装错文件） */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        KGVipAlert(@"已加载（自动领调试版）");
+        KGVipAlert([NSString stringWithFormat:@"已加载（%@）", KG_VER]);
+    });
+
+    /* 40 秒诊断：凭据还没到位就明说 */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(40.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!KGClaimDone && !KGCredsReady()) {
+            KGVipAlert([NSString stringWithFormat:@"%@诊断：40秒了凭据还没采到（KGNetworkTools 未命中）", KG_VER]);
+        }
     });
 
     /* 自动领：多次尝试兜底（凭据采集到位才执行） */
