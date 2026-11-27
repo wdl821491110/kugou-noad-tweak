@@ -49,22 +49,15 @@
 
 typedef void (^KGSuccessCB)(id);
 
-/* ============ v9: 运行时状态 / 通用工具 ============
- * 1) 保存被替换方法的原始 IMP，便于「先调用原实现，再判断是否隐藏」；
- * 2) 记录命中关键词的 indexPath，供 sizeForItem / heightForRow 归零；
- * 3) 按 cell 内文字识别，避免类名猜错。 */
+/* ============ v9c: 运行时状态 / 通用工具 ============
+ * v9c 回退全局 willDisplay hook 与按文字识别，只保留类级隐藏 + 点击拦截，
+ * 用于隔离验证启动黑屏闪退是否与全局列表 hook 有关。 */
 static NSMutableDictionary *KGOriginalIMPs = nil;
-static NSArray *KGHideKeywords = nil;
 
 static void KGInitRuntimeState(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         KGOriginalIMPs = [NSMutableDictionary dictionary];
-        KGHideKeywords = @[
-            @"TA也喜欢", @"ta也喜欢", @"TA特喜欢", @"ta特喜欢",
-            @"概念er新推", @"概念实验室", @"曲风盲盒", @"VIP专属", @"小众宝藏",
-            @"赚钱", @"赚金币", @"赚概念币", @"任务中心"
-        ];
     });
 }
 
@@ -75,40 +68,6 @@ static void KGStoreOriginalIMP(Method m) {
     if (KGOriginalIMPs[key]) { return; }
     IMP original = method_getImplementation(m);
     if (original) { KGOriginalIMPs[key] = [NSValue valueWithPointer:(void *)original]; }
-}
-
-static IMP KGOriginalIMP(Method m) {
-    KGInitRuntimeState();
-    if (!m) { return NULL; }
-    NSValue *value = KGOriginalIMPs[[NSValue valueWithPointer:(void *)m]];
-    return value ? (IMP)[value pointerValue] : NULL;
-}
-
-static BOOL KGTextMatches(NSString *text) {
-    if (text.length == 0) { return NO; }
-    for (NSString *keyword in KGHideKeywords) {
-        if ([text rangeOfString:keyword options:(NSCaseInsensitiveSearch | NSLiteralSearch)].location != NSNotFound) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-static BOOL KGViewTextMatches(UIView *view, NSInteger depth) {
-    if (!view || depth > 12) { return NO; }
-    if ([view isKindOfClass:[UILabel class]]) {
-        UILabel *label = (UILabel *)view;
-        if (KGTextMatches(label.text) || KGTextMatches(label.attributedText.string)) { return YES; }
-    }
-    if ([view isKindOfClass:[UIButton class]]) {
-        UIButton *button = (UIButton *)view;
-        if (KGTextMatches(button.titleLabel.text)) { return YES; }
-    }
-    if (KGTextMatches(view.accessibilityLabel)) { return YES; }
-    for (UIView *subview in view.subviews) {
-        if (KGViewTextMatches(subview, depth + 1)) { return YES; }
-    }
-    return NO;
 }
 
 static void KGHideView(UIView *view) {
@@ -228,51 +187,6 @@ static void KGNoop_CB3(id self, SEL _cmd, id a, id success, id error) { KGCallCB
 static void KGNoop_CB3Bool(id self, SEL _cmd, BOOL a, id success, id error) { KGCallCB(success); }
 static void KGNoop_CB4Bool(id self, SEL _cmd, BOOL a, id b, id success, id error) { KGCallCB(success); }
 static void KGNoop_CB4Id(id self, SEL _cmd, id a, id b, id success, id error) { KGCallCB(success); }
-
-/* ============ v9/v9b: 按文字隐藏（保留原实现，不改高度） ============
- * 这些 hook 不能置空原实现：先调用 original，再按 cell 内文字判断。
- * 原始 IMP 在 KGInstallSelectorHooks 替换前存进 KGOriginalIMPs。
- * v9b：不再 invalidateLayout / reloadData，也不改 size/height，
- * 避免 UICollectionView 反复重算导致启动黑屏后闪退。 */
-static IMP KGCurrentOriginalIMP(id self, SEL sel) {
-    return KGOriginalIMP(class_getInstanceMethod(object_getClass(self), sel));
-}
-
-static void KGWillDisplayCollectionCell(id self, SEL _cmd, UICollectionView *collectionView,
-                                        UICollectionViewCell *cell, NSIndexPath *indexPath) {
-    IMP original = KGCurrentOriginalIMP(self, _cmd);
-    if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, collectionView, cell, indexPath); }
-    if (KGViewTextMatches(cell, 0)) {
-        KGHideView(cell);
-        KGLogAlways(@"hidden collection cell by text: %ld-%ld",
-                    (long)indexPath.section, (long)indexPath.item);
-    }
-}
-
-static void KGWillDisplayTableCell(id self, SEL _cmd, UITableView *tableView,
-                                   UITableViewCell *cell, NSIndexPath *indexPath) {
-    IMP original = KGCurrentOriginalIMP(self, _cmd);
-    if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, tableView, cell, indexPath); }
-    if (KGViewTextMatches(cell, 0)) {
-        KGHideView(cell);
-        KGLogAlways(@"hidden table cell by text: %ld-%ld",
-                    (long)indexPath.section, (long)indexPath.row);
-    }
-}
-
-static void KGWillDisplaySupplementary(id self, SEL _cmd, UICollectionView *collectionView,
-                                       UIView *view, NSString *kind, NSIndexPath *indexPath) {
-    IMP original = KGCurrentOriginalIMP(self, _cmd);
-    if (original) { ((void (*)(id, SEL, id, id, id, id))original)(self, _cmd, collectionView, view, kind, indexPath); }
-    if (KGViewTextMatches(view, 0)) { KGHideView(view); }
-}
-
-static void KGWillDisplayTableHeader(id self, SEL _cmd, UITableView *tableView,
-                                     UIView *view, NSInteger section) {
-    IMP original = KGCurrentOriginalIMP(self, _cmd);
-    if (original) { ((void (*)(id, SEL, id, id, NSInteger))original)(self, _cmd, tableView, view, section); }
-    if (KGViewTextMatches(view, 0)) { KGHideView(view); }
-}
 
 /* ============ hook 注册表 ============ */
 typedef struct {
@@ -491,16 +405,6 @@ static KGSelHook kSelHooks[] = {
 };
 static const NSUInteger kSelHookCount = sizeof(kSelHooks) / sizeof(kSelHooks[0]);
 
-/* v9: 这些 hook 必须先调用原实现，不能置空。替换前保存 original IMP。 */
-static KGSelHook kPreserveSelHooks[] = {
-    {"collectionView:willDisplayCell:forItemAtIndexPath:", (IMP)KGWillDisplayCollectionCell},
-    {"tableView:willDisplayCell:forRowAtIndexPath:", (IMP)KGWillDisplayTableCell},
-    {"collectionView:willDisplaySupplementaryView:forElementKind:atIndexPath:", (IMP)KGWillDisplaySupplementary},
-    {"tableView:willDisplayHeaderView:forSection:", (IMP)KGWillDisplayTableHeader},
-    {"tableView:willDisplayFooterView:forSection:", (IMP)KGWillDisplayTableHeader},
-};
-static const NSUInteger kPreserveSelHookCount = sizeof(kPreserveSelHooks) / sizeof(kPreserveSelHooks[0]);
-
 static void KGInstallSelHookList(KGSelHook *list, NSUInteger listCount, NSMutableSet *hookedMethods) {
     unsigned int classCount = 0;
     Class *classes = objc_copyClassList(&classCount);
@@ -529,7 +433,6 @@ static void KGInstallSelectorHooks(void) {
     dispatch_once(&onceToken, ^{ hookedMethods = [NSMutableSet set]; });
 
     KGInstallSelHookList(kSelHooks, kSelHookCount, hookedMethods);
-    KGInstallSelHookList(kPreserveSelHooks, kPreserveSelHookCount, hookedMethods);
 }
 
 static void KGInstallAllHooks(void) {
