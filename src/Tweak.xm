@@ -502,10 +502,11 @@ static KGSelHook kPreserveSelHooks[] = {
 };
 static const NSUInteger kPreserveSelHookCount = sizeof(kPreserveSelHooks) / sizeof(kPreserveSelHooks[0]);
 
-static void KGInstallSelHookList(KGSelHook *list, NSUInteger listCount, NSMutableSet *hookedMethods) {
+static NSUInteger KGInstallSelHookList(KGSelHook *list, NSUInteger listCount, NSMutableSet *hookedMethods) {
     unsigned int classCount = 0;
     Class *classes = objc_copyClassList(&classCount);
-    if (!classes) { return; }
+    if (!classes) { return 0; }
+    __block NSUInteger added = 0;
     for (unsigned int i = 0; i < classCount; i++) {
         Class cls = classes[i];
         for (NSUInteger j = 0; j < listCount; j++) {
@@ -517,20 +518,24 @@ static void KGInstallSelHookList(KGSelHook *list, NSUInteger listCount, NSMutabl
             [hookedMethods addObject:key];
             KGStoreOriginalIMP(m);
             method_setImplementation(m, list[j].imp);
+            added++;
             KGLog(@"global hooked %s on %@", list[j].sel, NSStringFromClass(cls));
         }
     }
     free(classes);
+    return added;
 }
 
-static void KGInstallSelectorHooks(void) {
+static NSUInteger KGInstallSelectorHooksSlow(void) {
     KGInitRuntimeState();
     static NSMutableSet *hookedMethods = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{ hookedMethods = [NSMutableSet set]; });
 
-    KGInstallSelHookList(kSelHooks, kSelHookCount, hookedMethods);
-    KGInstallSelHookList(kPreserveSelHooks, kPreserveSelHookCount, hookedMethods);
+    NSUInteger added = 0;
+    added += KGInstallSelHookList(kSelHooks, kSelHookCount, hookedMethods);
+    added += KGInstallSelHookList(kPreserveSelHooks, kPreserveSelHookCount, hookedMethods);
+    return added;
 }
 
 static void KGInstallAllHooks(void) {
@@ -553,17 +558,35 @@ static void KGInstallAllHooks(void) {
         KGLogAlways(@"hooked %s -> %s", h->cls, h->sel);
     }
 
-    /* A+C：弹窗调度层全局 selector 挂载 */
-    KGInstallSelectorHooks();
-
     /* v8/v9：首页运营卡片 cell 运行时隐藏（定时器在 %ctor 里启动） */
     KGInstallCardCellHooks();
+}
+
+/* ============ v9e: 慢批次（全局 selector 遍历） ============
+ * 崩溃证据：objc_copyClassList 遍历 21529 类 × 200+ selector 的
+ * class_getInstanceMethod 在 didFinishLaunching 通知里同步执行，
+ * 把 scene-create 拖过 8.4 秒看门狗红线（栈：class_getInstanceMethod ← dylib）。
+ * 因此全局遍历绝不能出现在启动同步路径上：
+ * 只在 DidBecomeActive 之后 / 秒级延迟时机异步执行，成功一次即停。 */
+static NSUInteger KGInstallSelectorHooksSlow(void);
+
+static BOOL KGSlowHooksDone = NO;
+static void KGInstallSlowHooks(void) {
+    if (KGSlowHooksDone) { return; }
+    NSUInteger added = KGInstallSelectorHooksSlow();
+    if (added == 0) {
+        /* 没有新增 = 所有目标 selector 都已挂上，停止重试 */
+        KGSlowHooksDone = YES;
+        KGLogAlways(@"slow hooks all installed");
+    } else {
+        KGLogAlways(@"slow hooks +%lu new, will retry", (unsigned long)added);
+    }
 }
 
 %ctor {
     KGLogAlways(@"loaded for com.kugou.kgyouth 5.3.3 (runtime hook mode)");
 
-    /* 1. 立刻挂一次（类已在内存时直接生效） */
+    /* 1. 立刻挂一次（类已在内存时直接生效）——只跑快批次 */
     KGInstallAllHooks();
 
     /* 2. 主线程下一个 loop 再挂（覆盖 guest App 刚 dlopen 的情况），并启动 cell hook 重试定时器 */
@@ -572,7 +595,7 @@ static void KGInstallAllHooks(void) {
         KGStartCardHookTimer();
     });
 
-    /* 3. App 启动完成时再挂一次 */
+    /* 3. App 启动完成时再挂一次——仍然只跑快批次 */
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
@@ -580,7 +603,7 @@ static void KGInstallAllHooks(void) {
         KGInstallAllHooks();
     }];
 
-    /* 4. 分级延迟兜底：0.1 / 0.5 / 2 / 5 秒 */
+    /* 4. 分级延迟兜底：0.1 / 0.5 / 2 / 5 秒——只跑快批次 */
     NSArray *delays = @[@0.1, @0.5, @2.0, @5.0];
     for (NSNumber *d in delays) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
@@ -588,4 +611,24 @@ static void KGInstallAllHooks(void) {
             KGInstallAllHooks();
         });
     }
+
+    /* 5. 慢批次（全局 selector 遍历）：只在启动彻底完成后执行。
+     * DidBecomeActive 已在首帧渲染后；8/15 秒双兜底防漏。
+     * 主队列串行执行，与 hookedMethods set 的线程安全要求一致。 */
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            KGInstallSlowHooks();
+        });
+    }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        KGInstallSlowHooks();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        KGInstallSlowHooks();
+    });
 }
