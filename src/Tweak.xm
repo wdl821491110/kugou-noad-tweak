@@ -12,6 +12,8 @@
  *    realShowV3WithIsExpire:days:、showCalendarSignInAlert: 等。
  *  - v5-B：精简引导浮层（GuideView），拦 showGuideView/showSlideGuide 等
  *    真实显示方法；避开带 complete block 的方法防止回调不触发卡流程。
+ *  - v6-D：精简臃肿功能入口（直播/K歌/游戏/商城），只拦纯跳转方法，
+ *    不隐藏 view（防依赖崩溃）、不碰内购（防 VIP 买不了）、不碰带 block 的。
  */
 
 @import Foundation;
@@ -183,6 +185,23 @@ static KGSelHook kSelHooks[] = {
     {"canShowGuideAlert", (IMP)KGNoopNil},
     {"checkShowAutoGuide", (IMP)KGNoopNil},
     {"delayShowLyricHandbookGuide", (IMP)KGNoopNil},
+
+    /* v6-D: 臃肿功能入口（直播 / K歌 / 游戏 / 商城）纯跳转方法。
+     * 只拦 UI 跳转与入口点击：点了没反应，但不隐藏 view、不动依赖，不会崩。
+     * 刻意不碰：内购（goToAppStore 等，拦了 VIP 买不了）、主播开播、带 block 的方法。
+     * 入口图标可能仍显示，只是点进去无反应；彻底隐藏入口需另行逐类验证。 */
+    {"jumpToLivePage", (IMP)KGNoopNil},
+    {"enterGame", (IMP)KGNoopNil},
+    {"pushToGameViewController", (IMP)KGNoopNil},
+    {"gotoFriendlyBattleGame", (IMP)KGNoopNil},
+    {"gotoChangchangKsong", (IMP)KGNoopNil},
+    {"goToKTVListenWork", (IMP)KGNoopNil},
+    {"goToKtvPlayView:", (IMP)KGNoopNil},
+    {"jumpToKtvDetailVC:songInfo:", (IMP)KGNoopNil},
+    {"didClicKTVEnterButtonButton", (IMP)KGNoopNil},
+    {"p_ktvEnterButtonClicked:", (IMP)KGNoopNil},
+    {"enterStoreType:", (IMP)KGNoopNil},
+    {"jumpThemeStorePage", (IMP)KGNoopNil},
 };
 static const NSUInteger kSelHookCount = sizeof(kSelHooks) / sizeof(kSelHooks[0]);
 
