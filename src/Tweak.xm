@@ -1,127 +1,132 @@
 /* 酷狗音乐概念版 5.3.3 (com.kugou.kgyouth) 去广告 tweak
- * 策略：拦截广告"数据请求层"与"缓存层"，让广告数据为空 → 无广告可展示。
- * 只 hook 归属确定、签名精确的方法；不碰 UI 展示代码，避免闪退。
  *
- * 说明：
- *  - block 类型用 id 接收，置空广告数据时按需调用回调传空值，避免流程卡死。
- *  - 每个 hook 点可用宏 KG_DEBUG 打开日志。
+ * v2：全部改为「运行时挂载」。原因：LiveContainer 里 tweak 常常在宿主进程
+ * 早期加载，此时客制 App 的 ObjC 类还没注册，Logos 的 %hook 在 %ctor 里
+ * 拿不到类，hook 全部失效（表现为广告还在、Siri 词表照常注册并崩溃）。
+ * 现在用 objc_getClass + method_setImplementation，并在多个时机重试，
+ * 类什么时候出现就什么时候挂上。
  */
 
 @import Foundation;
+@import UIKit;
+#import <objc/runtime.h>
+#import <dlfcn.h>
 
 #define KG_DEBUG 0
+#define KGLogAlways(...) NSLog(@"[KGNoAd] " __VA_ARGS__)
 #if KG_DEBUG
-#define KGLog(...) NSLog(@"[KGNoAd] " __VA_ARGS__)
+#define KGLog(...) KGLogAlways(__VA_ARGS__)
 #else
 #define KGLog(...) do {} while (0)
 #endif
 
-/* ============ 开屏广告 ============ */
-/* KGSplashHttpDao: 开屏广告列表 / 实时开屏 / 资源下载 */
-%hook KGSplashHttpDao
+typedef void (^KGSuccessCB)(id);
 
-- (void)requestSplashListWithDownloadAds:(BOOL)downloadAds Error:(id)error {
-    KGLog(@"block splash list request");
-    // 不调用原实现：不拉取开屏广告
+static void KGCallCB(id cb) {
+    if (cb) { ((KGSuccessCB)cb)(nil); }
 }
 
-- (void)requestRealTimeSplashWithDownloadAds:(BOOL)downloadAds isStartSplash:(BOOL)isStart error:(id)error {
-    KGLog(@"block realtime splash request");
-}
+/* 通用空实现：void 返回 / id 返回 */
+static void KGNoop(id self, SEL _cmd, ...) { }
+static id KGNoopNil(id self, SEL _cmd, ...) { return nil; }
 
-- (void)requestDownloadSplashResourceWithError:(id)a andError:(id)b {
-    KGLog(@"block splash resource download");
-}
+/* 需要给回调传 nil，否则业务流程卡住 */
+static void KGNoop_CB2(id self, SEL _cmd, id success, id error) { KGCallCB(success); }
+static void KGNoop_CB3(id self, SEL _cmd, id a, id success, id error) { KGCallCB(success); }
+static void KGNoop_CB3Bool(id self, SEL _cmd, BOOL a, id success, id error) { KGCallCB(success); }
+static void KGNoop_CB4Bool(id self, SEL _cmd, BOOL a, id b, id success, id error) { KGCallCB(success); }
+static void KGNoop_CB4Id(id self, SEL _cmd, id a, id b, id success, id error) { KGCallCB(success); }
 
-- (void)requestDownloadSplashAudioWithModel:(id)model andError:(id)error {
-    KGLog(@"block splash audio download");
-}
+/* ============ hook 注册表 ============ */
+typedef struct {
+    const char *cls;
+    const char *sel;
+    IMP imp;
+    BOOL classMethod;
+    BOOL installed;
+} KGHook;
 
-%end
+static KGHook kHooks[] = {
+    /* 开屏广告 */
+    {"KGSplashHttpDao", "requestSplashListWithDownloadAds:Error:", (IMP)KGNoop, NO, NO},
+    {"KGSplashHttpDao", "requestRealTimeSplashWithDownloadAds:isStartSplash:error:", (IMP)KGNoop, NO, NO},
+    {"KGSplashHttpDao", "requestDownloadSplashResourceWithError:andError:", (IMP)KGNoop, NO, NO},
+    {"KGSplashHttpDao", "requestDownloadSplashAudioWithModel:andError:", (IMP)KGNoop, NO, NO},
+    {"SplashDBDao", "getNotExpiredSplashs", (IMP)KGNoopNil, NO, NO},
+    {"SplashDBDao", "getAvailableSplashs", (IMP)KGNoopNil, NO, NO},
 
-/* 开屏缓存：让 DB 查不到可用开屏，防止走本地缓存展示 */
-%hook SplashDBDao
-- (id)getNotExpiredSplashs { KGLog(@"empty splash cache"); return nil; }
-- (id)getAvailableSplashs { return nil; }
-%end
+    /* Banner / 信息流 */
+    {"ADBannerBLL", "requestBlueTipAdInfo:successBlock:errorBlock:", (IMP)KGNoop_CB3, NO, NO},
+    {"ADBannerBLL", "requestMineLinkAdInfos:successBlock:errorBlock:", (IMP)KGNoop_CB3, NO, NO},
+    {"ADBannerBLL", "requestTodaySongBannerAdInfo:", (IMP)KGNoop, NO, NO},
+    {"ADBannerBLL", "requestSearchBannerAdInfoWithLoadAds:successBlock:errorBlock:", (IMP)KGNoop_CB3Bool, NO, NO},
+    {"ADBannerBLL", "requestCommentBannerAdInfoWithLoadAds:songInfo:successBlock:errorBlock:", (IMP)KGNoop_CB4Bool, NO, NO},
+    {"ADBannerBLL", "requestMyInfoPageAdInfoWithSuccessBlock:errorBlock:", (IMP)KGNoop_CB2, NO, NO},
+    {"YouthHomeChannelBannerBLL", "requestBannerListWithSuccessBlock:failBlock:", (IMP)KGNoop_CB2, NO, NO},
+    {"YouthHomeChannelBannerBLL", "requestBannerListWithBusiParam:biz:successBlock:failBlock:", (IMP)KGNoop_CB4Id, NO, NO},
+    {"KGMusicHomeBannerBLL", "getBannerInfoWithResultBlock:errorBlock:", (IMP)KGNoop_CB2, NO, NO},
 
-/* ============ Banner / 信息流广告 ============ */
-%hook ADBannerBLL
+    /* 激励广告曝光/点击上报 */
+    {"YouthAdvertBiManager", "sendEnterExposureBIWithSourceId:", (IMP)KGNoop, NO, NO},
+    {"YouthAdvertBiManager", "sendEnterExposureBIWithSourceId:extraDict:", (IMP)KGNoop, NO, NO},
+    {"YouthAdvertBiManager", "sendEnterClickBIWithSourceId:", (IMP)KGNoop, NO, NO},
+    {"YouthAdvertBiManager", "sendEnterClickBIWithSourceId:type:", (IMP)KGNoop, NO, NO},
 
-- (void)requestBlueTipAdInfo:(id)a successBlock:(id)success errorBlock:(id)error {
-    KGLog(@"block blue tip ad");
-    if (success) { ((void(^)(id))success)(nil); }
-}
-- (void)requestMineLinkAdInfos:(id)a successBlock:(id)success errorBlock:(id)error {
-    KGLog(@"block mine link ad");
-    if (success) { ((void(^)(id))success)(nil); }
-}
-- (void)requestTodaySongBannerAdInfo:(id)error {
-    KGLog(@"block today song banner");
-}
-- (void)requestSearchBannerAdInfoWithLoadAds:(BOOL)load successBlock:(id)success errorBlock:(id)error {
-    KGLog(@"block search banner");
-    if (success) { ((void(^)(id))success)(nil); }
-}
-- (void)requestCommentBannerAdInfoWithLoadAds:(BOOL)load songInfo:(id)song successBlock:(id)success errorBlock:(id)error {
-    KGLog(@"block comment banner");
-    if (success) { ((void(^)(id))success)(nil); }
-}
-- (void)requestMyInfoPageAdInfoWithSuccessBlock:(id)success errorBlock:(id)error {
-    KGLog(@"block mine page ad");
-    if (success) { ((void(^)(id))success)(nil); }
-}
+    /* Siri 词表：app 层入口 */
+    {"KGMediaIntentStartTask", "registerCustomVocabulary", (IMP)KGNoop, NO, NO},
 
-%end
+    /* Siri 词表：系统层兜底（Intents 可能晚加载） */
+    {"INVocabulary", "setVocabularyStrings:ofType:", (IMP)KGNoop, NO, NO},
+};
 
-%hook YouthHomeChannelBannerBLL
-- (void)requestBannerListWithSuccessBlock:(id)success failBlock:(id)fail {
-    KGLog(@"block home channel banner");
-    if (success) { ((void(^)(id))success)(nil); }
+static const NSUInteger kHookCount = sizeof(kHooks) / sizeof(kHooks[0]);
+
+static void KGInstallAllHooks(void) {
+    /* 强制把 Intents 拉进来，保证 INVocabulary 类可解析 */
+    static dispatch_once_t onceTokens;
+    dispatch_once(&onceTokens, ^{
+        dlopen("/System/Library/Frameworks/Intents.framework/Intents", RTLD_NOW | RTLD_GLOBAL);
+    });
+
+    for (NSUInteger i = 0; i < kHookCount; i++) {
+        KGHook *h = &kHooks[i];
+        if (h->installed) { continue; }
+        Class cls = objc_getClass(h->cls);
+        if (!cls) { continue; }
+        SEL sel = sel_registerName(h->sel);
+        Method m = h->classMethod ? class_getClassMethod(cls, sel) : class_getInstanceMethod(cls, sel);
+        if (!m) { continue; }
+        method_setImplementation(m, h->imp);
+        h->installed = YES;
+        KGLogAlways(@"hooked %s -> %s", h->cls, h->sel);
+    }
 }
-- (void)requestBannerListWithBusiParam:(id)param biz:(id)biz successBlock:(id)success failBlock:(id)fail {
-    KGLog(@"block home channel banner v2");
-    if (success) { ((void(^)(id))success)(nil); }
-}
-%end
-
-%hook KGMusicHomeBannerBLL
-- (void)getBannerInfoWithResultBlock:(id)result errorBlock:(id)error {
-    KGLog(@"block music home banner");
-    if (result) { ((void(^)(id))result)(nil); }
-}
-%end
-
-/* ============ 激励广告入口（看广告得 VIP 等）============ */
-/* 只拦截曝光/点击上报，不影响激励发放逻辑本身 */
-%hook YouthAdvertBiManager
-- (void)sendEnterExposureBIWithSourceId:(id)a { KGLog(@"no ad exposure BI"); }
-- (void)sendEnterExposureBIWithSourceId:(id)a extraDict:(id)b { }
-- (void)sendEnterClickBIWithSourceId:(id)a { }
-- (void)sendEnterClickBIWithSourceId:(id)a type:(id)b { }
-%end
-
-/* ============ 屏蔽 Siri 词表注册 ============ */
-/* 酷狗会向 Siri 注册自定义词表（歌手名/歌名），这里拦截掉 */
-%hook KGMediaIntentStartTask
-- (void)registerCustomVocabulary {
-    KGLog(@"block Siri custom vocabulary registration");
-    // 不调用原实现：不向 Siri 注册词表
-}
-%end
-
-/* INVocabulary 是苹果系统类，setVocabularyStrings:ofType: 是词表写入口。
- * hook 置空，覆盖所有走系统 API 的词表注册路径（ofType 为 NSInteger 枚举）。 */
-%hook INVocabulary
-- (void)setVocabularyStrings:(id)strings ofType:(NSInteger)type {
-    KGLog(@"block INVocabulary setVocabularyStrings");
-    // 不写入任何词表
-}
-%end
-
-/* ============ 播放器页广告 View（保险：直接隐藏） ============ */
-/* 这些类归属确定的用 hook；找不到归属的靠上面请求层拦截兜底 */
 
 %ctor {
-    KGLog(@"KGNoAd loaded for com.kugou.kgyouth 5.3.3");
+    KGLogAlways(@"loaded for com.kugou.kgyouth 5.3.3 (runtime hook mode)");
+
+    /* 1. 立刻挂一次（类已在内存时直接生效） */
+    KGInstallAllHooks();
+
+    /* 2. 主线程下一个 loop 再挂（覆盖 guest App 刚 dlopen 的情况） */
+    dispatch_async(dispatch_get_main_queue(), ^{
+        KGInstallAllHooks();
+    });
+
+    /* 3. App 启动完成时再挂一次 */
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        KGInstallAllHooks();
+    }];
+
+    /* 4. 分级延迟兜底：0.1 / 0.5 / 2 / 5 秒 */
+    NSArray *delays = @[@0.1, @0.5, @2.0, @5.0];
+    for (NSNumber *d in delays) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            KGInstallAllHooks();
+        });
+    }
 }
