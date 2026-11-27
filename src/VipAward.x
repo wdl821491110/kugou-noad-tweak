@@ -15,7 +15,17 @@
 
 static void KGVipAlert(NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *root = [UIApplication sharedApplication].keyWindow.rootViewController;
+        UIViewController *root = nil;
+        /* iOS13+ scene API：遍历所有连接 scene 找前台 key window，避免 keyWindow 弃用告警 */
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) { continue; }
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            if (ws.activationState != UISceneActivationStateForegroundActive) { continue; }
+            for (UIWindow *win in ws.windows) {
+                if (win.isKeyWindow) { root = win.rootViewController; break; }
+            }
+            if (root) { break; }
+        }
         if (!root) { return; }
         while (root.presentedViewController) { root = root.presentedViewController; }
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"KGVipAward"
