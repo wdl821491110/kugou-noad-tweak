@@ -7,7 +7,7 @@
 #import <objc/message.h>
 #import <CommonCrypto/CommonDigest.h>
 
-#define KG_VER   @"v6"
+#define KG_VER   @"v7"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"   // DL Music calculateMid 风格的固定 30 位十进制
@@ -95,7 +95,20 @@ static void KGVipAlert(NSString *msg) {
 }
 
 // ---------- 凭据采集 ----------
-// 主动读 KGHistoryUserTokenManager（持久化 userId+token，登录后必落盘，最可靠）
+// 0) 手填凭据：Documents/Tweaks/kugou/kgcreds.json {"token":"...","userid":"..."}
+static void KGReadCredsFile(void) {
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/Tweaks/kugou/kgcreds.json"];
+    NSData *d = [NSData dataWithContentsOfFile:p];
+    if (!d) { return; }
+    id j = nil;
+    @try { j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil]; } @catch (__unused NSException *ex) {}
+    if (![j isKindOfClass:NSDictionary.class]) { return; }
+    NSString *t = KGStr(j[@"token"]);
+    NSString *u = KGStr(j[@"userid"]);
+    if (t.length > 0 && u.length > 0) { KGSaveCreds(t, u); }
+}
+
+// 1) 主动读 KGHistoryUserTokenManager（持久化 userId+token，登录后必落盘，最可靠）
 static void KGReadHistoryToken(void) {
     Class c = objc_getClass("KGHistoryUserTokenManager");
     if (!c) { return; }
@@ -215,8 +228,9 @@ static void KGDoClaim(void) {
             NSInteger code = -999;
             if ([json[@"status"] respondsToSelector:@selector(intValue)]) { code = [json[@"status"] intValue]; }
             NSString *em = KGStr(json[@"error_code"]);
-            if (code == 0) { msg = @"签到成功"; }
+            if (code == 1) { msg = @"签到成功"; }
             else if ([em isEqualToString:@"131001"]) { msg = @"今天已签到"; }
+            else if ([em isEqualToString:@"20028"]) { msg = @"账号风控(20028)，去手机酷狗领"; }
             else { msg = [NSString stringWithFormat:@"签到失败 code=%@ status=%@ msg=%@", em, KGStr(json[@"status"]), KGStr(json[@"error_msg"])]; }
         }
         KGVipAlert([NSString stringWithFormat:@"自动领(%@)：%@", KG_VER, msg]);
@@ -237,8 +251,11 @@ static void KGDoUpgrade(void) {
         else {
             NSInteger code = -999;
             if ([json[@"status"] respondsToSelector:@selector(intValue)]) { code = [json[@"status"] intValue]; }
-            if (code == 0) { msg = @"升级成功，已领概念版 VIP 1 天"; KGDoneToday = YES; }
-            else { msg = [NSString stringWithFormat:@"升级失败 code=%@ status=%@ msg=%@", KGStr(json[@"error_code"]), KGStr(json[@"status"]), KGStr(json[@"error_msg"])]; }
+            NSString *em = KGStr(json[@"error_code"]);
+            if (code == 1) { msg = @"升级成功，已领概念版 VIP 1 天"; KGDoneToday = YES; }
+            else if ([em isEqualToString:@"131001"]) { msg = @"今天已签到"; KGDoneToday = YES; }
+            else if ([em isEqualToString:@"20028"]) { msg = @"账号风控(20028)，去手机酷狗领"; }
+            else { msg = [NSString stringWithFormat:@"升级失败 code=%@ status=%@ msg=%@", em, KGStr(json[@"status"]), KGStr(json[@"error_msg"])]; }
         }
         KGVipAlert([NSString stringWithFormat:@"自动领(%@)：%@", KG_VER, msg]);
     });
@@ -248,6 +265,7 @@ static void KGDoUpgrade(void) {
 static void KGAutoClaimTick(BOOL verbose) {
     if (KGDoneToday) { return; }
     KGLoadCreds();
+    KGReadCredsFile();
     KGReadHistoryToken();
     KGReadLoginManager();
     @synchronized (KGCreds) {
@@ -295,8 +313,9 @@ static void KGAutoClaimTick(BOOL verbose) {
                 histInfo = @"类:有 实例:无";
             }
         }
-        KGVipAlert([NSString stringWithFormat:@"%@诊断: 缺[token,userid]\n管理器类:%@ 实例:%@ isLogin:%@\ntoken长度:%@ kugouId:%@\nUserDefaults兜底:%@\n历史账号存储:%@",
-                    KG_VER, c ? @"有" : @"无", hasInst ? @"有" : @"无", login ? @"Y" : @"N", tokLen, kid, scan, histInfo]);
+        BOOL hasFile = [[NSFileManager defaultManager] fileExistsAtPath:[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/Tweaks/kugou/kgcreds.json"]];
+        KGVipAlert([NSString stringWithFormat:@"%@诊断: 缺[token,userid]\n管理器类:%@ 实例:%@ isLogin:%@\ntoken长度:%@ kugouId:%@\nUserDefaults兜底:%@\n历史账号存储:%@\n手填文件kgcreds.json:%@",
+                    KG_VER, c ? @"有" : @"无", hasInst ? @"有" : @"无", login ? @"Y" : @"N", tokLen, kid, scan, histInfo, hasFile ? @"存在" : @"无"]);
     }
 }
 
@@ -334,6 +353,7 @@ static void KGBootstrap(void) {
                    dispatch_get_main_queue(), ^{
         static BOOL announced = NO;
         KGLoadCreds();
+        KGReadCredsFile();
         KGReadHistoryToken();
         KGReadLoginManager();
         NSString *token = nil, *userid = nil;
