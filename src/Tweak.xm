@@ -1,10 +1,12 @@
-/* 酷狗音乐概念版 5.3.3 (com.kugou.kgyouth) 去广告 tweak
+/* 酷狗音乐概念版 5.3.3 (com.kugou.kgyouth) 去广告 + 精简 tweak
  *
- * v2：全部改为「运行时挂载」。原因：LiveContainer 里 tweak 常常在宿主进程
- * 早期加载，此时客制 App 的 ObjC 类还没注册，Logos 的 %hook 在 %ctor 里
- * 拿不到类，hook 全部失效（表现为广告还在、Siri 词表照常注册并崩溃）。
- * 现在用 objc_getClass + method_setImplementation，并在多个时机重试，
- * 类什么时候出现就什么时候挂上。
+ * v3 = v2 运行时挂载 + A+C 弹窗精简：
+ *  - v2：全部 hook 改为「运行时挂载」。原因：LiveContainer 里 tweak 常在宿主
+ *    进程早期加载，此时客制 App 的 ObjC 类还没注册，Logos %hook 在 %ctor 里
+ *    拿不到类，hook 全失效（广告还在、Siri 词表照常注册并崩溃）。现用
+ *    objc_getClass + method_setImplementation，多时机重试，类何时注册何时挂。
+ *  - A 运营弹窗：KGAlertManager / YouthAlertQueueJob 调度层，按 selector 全局挂载。
+ *  - C 更新/VIP 到期弹窗：checkAndShowUpdateMessage / checkShowVIPExpireAlert 等。
  */
 
 @import Foundation;
@@ -81,6 +83,62 @@ static KGHook kHooks[] = {
 
 static const NSUInteger kHookCount = sizeof(kHooks) / sizeof(kHooks[0]);
 
+/* ============ A+C：弹窗调度层，按 selector 全局挂载 ============
+ * 这些 selector 归属的核心类 method list 格式特殊，静态解析拿不到，
+ * 所以运行时遍历所有已注册类，谁实现这些 selector 就换掉谁的实现。
+ * 统一用 KGNoopNil：void 方法无害；BOOL 方法返回 NO；id 方法返回 nil。
+ * selector 都是酷狗业务专有词，不会命中系统类。 */
+typedef struct {
+    const char *sel;
+    IMP imp;
+} KGSelHook;
+
+static KGSelHook kSelHooks[] = {
+    /* A. 运营弹窗调度中心 */
+    {"showAlertWithKGAlertManager", (IMP)KGNoopNil},
+    {"showAlertWithKGAlertManagerWithAppStoreBlock:feedBackBlock:closeBlock:", (IMP)KGNoopNil},
+    {"kgAlertManagerShowAlert:", (IMP)KGNoopNil},
+    {"kgAlertManagerWaitAlert:", (IMP)KGNoopNil},
+    {"kgAlertManagerWillShowWithJob:", (IMP)KGNoopNil},
+    {"kgAlertManagerCanShowNextJob", (IMP)KGNoopNil},
+    {"kgAlertManagerCanPassRuleWithJob:", (IMP)KGNoopNil},
+    {"kgAlertManagerCanShowInCurrentPage:", (IMP)KGNoopNil},
+    {"kgAlertManagerCanShowInCurrentTab:", (IMP)KGNoopNil},
+    /* C. 更新 / VIP 到期弹窗 */
+    {"checkAndShowUpdateMessage", (IMP)KGNoopNil},
+    {"checkVersionUpdate", (IMP)KGNoopNil},
+    {"forceShowUpdateAlert", (IMP)KGNoopNil},
+    {"checkShowVIPExpireAlert", (IMP)KGNoopNil},
+    {"checkShowWVIPExpireAlert", (IMP)KGNoopNil},
+    {"checkShowPlayPagePriviledgeVipExpireAlert", (IMP)KGNoopNil},
+    {"checkShowInviteVipAlert", (IMP)KGNoopNil},
+};
+static const NSUInteger kSelHookCount = sizeof(kSelHooks) / sizeof(kSelHooks[0]);
+
+static void KGInstallSelectorHooks(void) {
+    static NSMutableSet *hookedMethods = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ hookedMethods = [NSMutableSet set]; });
+
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) { return; }
+    for (unsigned int i = 0; i < count; i++) {
+        Class cls = classes[i];
+        for (NSUInteger j = 0; j < kSelHookCount; j++) {
+            SEL sel = sel_registerName(kSelHooks[j].sel);
+            Method m = class_getInstanceMethod(cls, sel);
+            if (!m) { continue; }
+            NSValue *key = [NSValue valueWithPointer:(void *)m];
+            if ([hookedMethods containsObject:key]) { continue; }
+            [hookedMethods addObject:key];
+            method_setImplementation(m, kSelHooks[j].imp);
+            KGLog(@"global hooked %s on %@", kSelHooks[j].sel, NSStringFromClass(cls));
+        }
+    }
+    free(classes);
+}
+
 static void KGInstallAllHooks(void) {
     /* 强制把 Intents 拉进来，保证 INVocabulary 类可解析 */
     static dispatch_once_t onceTokens;
@@ -100,6 +158,9 @@ static void KGInstallAllHooks(void) {
         h->installed = YES;
         KGLogAlways(@"hooked %s -> %s", h->cls, h->sel);
     }
+
+    /* A+C：弹窗调度层全局 selector 挂载 */
+    KGInstallSelectorHooks();
 }
 
 %ctor {
