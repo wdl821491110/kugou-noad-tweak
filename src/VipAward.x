@@ -401,8 +401,8 @@ static void KGVipInstallEntryHooks(void) {
         if (KGCredsReady()) { KGAutoClaim(); return; }
         @synchronized (KGCreds) {
             NSMutableArray *miss = [NSMutableArray array];
-            if (KGCreds[@"token"].length == 0) { [miss addObject:@"token"]; }
-            if (KGCreds[@"userid"].length == 0) { [miss addObject:@"userid"]; }
+            if ([NSString stringWithFormat:@"%@", KGCreds[@"token"] ?: @""].length == 0) { [miss addObject:@"token"]; }
+            if ([NSString stringWithFormat:@"%@", KGCreds[@"userid"] ?: @""].length == 0) { [miss addObject:@"userid"]; }
             KGVipAlert([NSString stringWithFormat:@"%@诊断：缺 [%@]，登录管理器也没读到", KG_VER,
                         miss.count ? [miss componentsJoinedByString:@","] : @"无"]);
         }
