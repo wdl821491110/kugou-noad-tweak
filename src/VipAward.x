@@ -10,7 +10,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 
-#define KG_VER   @"v15b"
+#define KG_VER   @"v16"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"
@@ -133,10 +133,35 @@ static BOOL KGUsable(NSString *s) {
 static int KGObsUrlCount = 0;
 static int KGObsDictCount = 0;
 
+// ── v16 核心 ────────────────────────────────────────────────────────────
+// 实测结论（本机重放 App 原始 URL 已验证）：
+//   * App 用 appid=3114 / clientver=12530，签名 salt 不在客户端明文里，本地无法复算；
+//   * 但 signature 只依赖「参数集合」，不绑定 path —— 同一组参数换成另一个接口，
+//     签名依然被服务端接受（receive_vip_listen_song / upgrade_vip_reward 均回业务码）。
+// 因此不再自己算签名：抓一条 App 已签好的标准凭证请求，整段 query 原样保留，
+// 只把 path 换掉即可。零猜测、零 salt 依赖。
+static NSString *KGReplayQuery = nil;
+static NSDictionary *KGReplayHeaders = nil;
+static NSTimeInterval KGReplayAt = 0;
+static int KGReplayParamCount = 0;
+static NSObject *KGReplayLock = nil;
+
+static void KGReplayLockInit(void) {
+    if (!KGReplayLock) { KGReplayLock = [NSObject new]; }
+}
+
+static void KGReplayConsider(NSString *url, NSDictionary *p);
+static BOOL KGReplayReady(void);
+
 static void KGObserveURL(NSString *url, NSString *saltHint) {
     if (url.length < 10) { return; }
+    // v16：replay 采集不受下面的计数上限限制，保证签名始终是最新的
+    if ([url containsString:@"/youth/"] && [url containsString:@"signature="]) {
+        NSDictionary *rp = KGQueryDict(url);
+        if (rp.count) { KGReplayConsider(url, rp); }
+    }
     if (saltHint.length >= 16 && ![saltHint isEqualToString:@"-"]) { KGAppSalt = saltHint; }
-    if (KGObsUrlCount > 400) { return; }
+    if (KGObsUrlCount > 3000) { return; }
     KGObsUrlCount++;
     NSDictionary *p = KGQueryDict(url);
     if (p.count == 0) { return; }
@@ -175,6 +200,36 @@ static void KGObserveURL(NSString *url, NSString *saltHint) {
         [kv addObject:[NSString stringWithFormat:@"sigMatch=%@", [[mine lowercaseString] isEqualToString:[sig lowercaseString]] ? @"Y" : @"N"]];
     }
     KGLogReq([NSString stringWithFormat:@"%@ | tok=%@ | %@", path, KGMaskToken(t), [kv componentsJoinedByString:@"&"]]);
+}
+
+// v16：只要 query 里带齐 token/userid/signature/appid/clienttime，就可整段复用。
+// 参数越少越好——换 path 后服务端不会因多余业务参数报错。
+static BOOL KGIsStdSignedQuery(NSDictionary *p) {
+    if (KGStr(p[@"token"]).length != 64) { return NO; }
+    if (KGStr(p[@"userid"]).length == 0) { return NO; }
+    if (KGStr(p[@"signature"]).length < 32) { return NO; }
+    if (KGStr(p[@"appid"]).length == 0) { return NO; }
+    if (KGStr(p[@"clienttime"]).length == 0) { return NO; }
+    return YES;
+}
+
+static void KGReplayConsider(NSString *url, NSDictionary *p) {
+    if (![url containsString:@"/youth/"]) { return; }
+    if (!KGIsStdSignedQuery(p)) { return; }
+    NSRange qr = [url rangeOfString:@"?"];
+    if (qr.location == NSNotFound) { return; }
+    NSString *q = [url substringFromIndex:qr.location + 1];
+    if (q.length < 60) { return; }
+    KGReplayLockInit();
+    @synchronized (KGReplayLock) {
+        if ([q isEqualToString:KGReplayQuery]) { return; }
+        BOOL fresh = (KGReplayQuery.length > 0 && KGReplayAt > 0 &&
+                      ([NSDate date].timeIntervalSince1970 - KGReplayAt) < 60);
+        if (fresh && (int)p.count >= KGReplayParamCount) { return; }   // 60 秒内只接受更精简的
+        KGReplayQuery = [q copy];
+        KGReplayParamCount = (int)p.count;
+        KGReplayAt = [NSDate date].timeIntervalSince1970;
+    }
 }
 
 // 优先用从 App 自身签名链路观测到的配置（salt/appid/clientver/dfid/mid）
@@ -296,6 +351,16 @@ static void KGWriteDiag(NSString *extra) {
         H_SignA?@"OK":@"MISS", H_SignB?@"OK":@"MISS", H_DaoKey?@"OK":@"MISS", H_DaoInfo?@"OK":@"MISS"];
     [s appendFormat:@"hooks14: requrl=%@ setbody=%@ observed=%@ urls=%d\n",
         H_ReqURL?@"OK":@"MISS", H_SetBody?@"OK":@"MISS", KGObservedToken?@"YES":@"NO", KGObsUrlCount];
+    // v16：是否抓到可复用的 App 已签名请求（ready=YES 即整条链路具备执行条件）
+    {
+        NSTimeInterval rat = 0;
+        NSUInteger qlen = 0;
+        KGReplayLockInit();
+        @synchronized (KGReplayLock) { rat = KGReplayAt; qlen = KGReplayQuery.length; }
+        double age = rat > 0 ? ([NSDate date].timeIntervalSince1970 - rat) : -1;
+        [s appendFormat:@"replay: ready=%@ age=%.0fs qlen=%lu\n",
+            KGReplayReady()?@"YES":@"NO", age, (unsigned long)qlen];
+    }
     // v15：App 自己发出的 youth 请求原始 URL（含 signature），用于反推 appid=3114 的 salt
     @synchronized (KGRawReqs) {
         [s appendString:@"rawreq:"];
@@ -623,8 +688,13 @@ static NSString *KGEnc(NSString *v) {
     return [v stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.alphanumericCharacterSet];
 }
 
+static BOOL KGReplayReady(void);
+static void KGReplayPost(NSString *path, void (^done)(NSDictionary *json, NSError *err));
+
 static void KGPost(NSString *path, NSMutableDictionary *params,
                    void (^done)(NSDictionary *json, NSError *err)) {
+    // v16：只要抓到 App 已签名请求，就整段复用，绝不自己算签名
+    if (KGReplayReady()) { KGReplayPost(path, done); return; }
     params[@"dfid"] = KGCurDfid();
     params[@"uuid"] = @"-";
     params[@"mid"] = KGCurMid();
@@ -651,6 +721,53 @@ static void KGPost(NSString *path, NSMutableDictionary *params,
     [req setValue:@"5d816a0" forHTTPHeaderField:@"kg-thash"];
     [req setValue:@"1" forHTTPHeaderField:@"kg-rec"];
     [req setValue:KG_RF forHTTPHeaderField:@"kg-rf"];
+    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    req.timeoutInterval = 15;
+
+    NSURLSession *s = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration];
+    NSURLSessionDataTask *t = [s dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (e || !d) { done(nil, e); return; }
+        id json = nil;
+        @try { json = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil]; } @catch (__unused NSException *ex) {}
+        done([json isKindOfClass:NSDictionary.class] ? json : nil, nil);
+    }];
+    [t resume];
+}
+
+// v16：用 App 已签名的 query 串直接发目标接口（只换 path，参数一字不改）
+static BOOL KGReplayReady(void) {
+    KGReplayLockInit();
+    BOOL ok = NO;
+    @synchronized (KGReplayLock) {
+        ok = (KGReplayQuery.length > 0 && KGReplayAt > 0 &&
+              ([NSDate date].timeIntervalSince1970 - KGReplayAt) < 600);
+    }
+    return ok;
+}
+
+static void KGReplayPost(NSString *path, void (^done)(NSDictionary *json, NSError *err)) {
+    KGReplayLockInit();
+    NSString *q = nil;
+    NSDictionary *hd = nil;
+    NSTimeInterval at = 0;
+    @synchronized (KGReplayLock) { q = [KGReplayQuery copy]; hd = [KGReplayHeaders copy]; at = KGReplayAt; }
+    double age = at > 0 ? ([NSDate date].timeIntervalSince1970 - at) : 1e9;
+    if (q.length == 0 || age > 600) {
+        NSString *m = (q.length == 0) ? @"未抓到 App 已签名请求" : @"签名已过期，等 App 再发一次";
+        done(nil, [NSError errorWithDomain:@"KGReplay" code:-1 userInfo:@{NSLocalizedDescriptionKey: m}]);
+        return;
+    }
+    NSString *url = [NSString stringWithFormat:@"https://gateway.kugou.com%@?%@", path, q];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
+    objc_setAssociatedObject(req, &kKGOurReqKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    req.HTTPMethod = @"POST";
+    req.HTTPBody = [NSData data];
+    for (NSString *k in hd) {
+        if (![k isKindOfClass:NSString.class]) { continue; }
+        NSString *v = KGStr(hd[k]);
+        if (k.length && v.length) { [req setValue:v forHTTPHeaderField:k]; }
+    }
+    if (![req valueForHTTPHeaderField:@"User-Agent"]) { [req setValue:KG_UA forHTTPHeaderField:@"User-Agent"]; }
     [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
     req.timeoutInterval = 15;
 
@@ -978,7 +1095,8 @@ static void KGDoClaim(void) {
     if (inflight) { return; }
     NSString *token = nil, *userid = nil;
     @synchronized (KGCreds) { token = KGCreds[@"token"]; userid = KGCreds[@"userid"]; }
-    if (token.length == 0 || userid.length == 0) { return; }
+    // v16：抓到 App 已签名请求时不需要本地凭据，凭证已在 query 里
+    if ((token.length == 0 || userid.length == 0) && !KGReplayReady()) { return; }
     inflight = YES;
 
     NSMutableDictionary *p = [NSMutableDictionary dictionary];
@@ -987,6 +1105,11 @@ static void KGDoClaim(void) {
     p[@"token"] = token;
     p[@"userid"] = userid;
     KGPost(@"/youth/v1/recharge/receive_vip_listen_song", p, ^(NSDictionary *json, NSError *err) {
+        if (err && [err.domain isEqualToString:@"KGReplay"]) {
+            inflight = NO;
+            KGWriteDiag([NSString stringWithFormat:@"v16 领取跳过：%@", err.localizedDescription]);
+            return;
+        }
         NSString *msg;
         if (err) { msg = [NSString stringWithFormat:@"签到网络错误: %@", err.localizedDescription]; }
         else {
@@ -1026,6 +1149,10 @@ static void KGDoUpgrade(void) {
     p[@"ad_type"] = @"1";
     if (token.length > 0) { p[@"token"] = token; p[@"userid"] = userid; }
     KGPost(@"/youth/v1/listen_song/upgrade_vip_reward", p, ^(NSDictionary *json, NSError *err) {
+        if (err && [err.domain isEqualToString:@"KGReplay"]) {
+            KGWriteDiag([NSString stringWithFormat:@"v16 升级跳过：%@", err.localizedDescription]);
+            return;
+        }
         NSString *msg;
         if (err) { msg = [NSString stringWithFormat:@"升级网络错误: %@", err.localizedDescription]; }
         else {
@@ -1034,11 +1161,12 @@ static void KGDoUpgrade(void) {
             NSString *em = KGStr(json[@"error_code"]);
             if (code == 1) { msg = @"升级成功，已领概念版 VIP 1 天"; KGDoneToday = YES; }
             else if ([em isEqualToString:@"131001"]) { msg = @"今天已签到"; KGDoneToday = YES; }
+            else if ([em isEqualToString:@"297002"]) { msg = @"今天已升级"; KGDoneToday = YES; }
             else if ([em isEqualToString:@"20028"]) { msg = @"账号风控(20028)"; }
             else { msg = [NSString stringWithFormat:@"升级失败 code=%@ status=%@ msg=%@", em, KGStr(json[@"status"]), KGStr(json[@"error_msg"])]; }
         }
         BOOL kgFail = ([msg hasPrefix:@"升级失败"] || [msg hasPrefix:@"升级网络错误"]);
-        BOOL kgNoop = [msg isEqualToString:@"今天已签到"];
+        BOOL kgNoop = ([msg isEqualToString:@"今天已签到"] || [msg isEqualToString:@"今天已升级"]);
         static BOOL kgUpFailAlerted = NO;
         if (!kgNoop && (!kgFail || !kgUpFailAlerted)) {
             if (kgFail) { kgUpFailAlerted = YES; }
