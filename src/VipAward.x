@@ -124,7 +124,7 @@ static void KGWriteDiag(NSString *extra) {
                        @"KGCommonParamDao", @"KGHistoryUserTokenManager", @"KTVUserManager",
                        @"ADCUserProvider", @"KGNetworkTools", @"__NSCFURLSession"];
     for (NSString *n in names) {
-        [s appendFormat:@"class %@: %@\n", n, objc_getClass(n.name.UTF8String) ? @"Y" : @"N"];
+        [s appendFormat:@"class %@: %@\n", n, objc_getClass(n.UTF8String) ? @"Y" : @"N"];
     }
     // UserDefaults 键
     NSDictionary *ud = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
@@ -183,7 +183,7 @@ static void KGReadLoginManager(void) {
 
 // 运行时自动探测：找「有 token getter + 单例入口」的类，直接读 token/isLogin/uid
 static void KGProbeAllSingletons(void) {
-    int count = 0;
+    unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     if (!classes) { return; }
     NSMutableString *rep = [NSMutableString string];
@@ -191,7 +191,7 @@ static void KGProbeAllSingletons(void) {
                          @"sharedManager", @"shared", @"sharedUserInfo", @"currentUser"];
     NSArray *uidSels = @[@"kugouId", @"userid", @"userId", @"getUserId",
                          @"getLatestLoginUserId", @"kugouid", @"uid"];
-    for (int i = 0; i < count; i++) {
+    for (unsigned int i = 0; i < count; i++) {
         Class c = classes[i];
         const char *cn = class_getName(c);
         if (!cn) { continue; }
