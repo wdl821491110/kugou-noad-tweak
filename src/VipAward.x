@@ -9,7 +9,7 @@
 #import <objc/message.h>
 #import <CommonCrypto/CommonDigest.h>
 
-#define KG_VER   @"v11"
+#define KG_VER   @"v12"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"
@@ -38,6 +38,12 @@ static NSString *KGProbeReport = @"";
 static NSString *KGTokenTestReport = @"";
 static NSString *KGAPITestReport = @"";
 static NSMutableArray *KGReqLog = nil;   // App 自身请求 URL（脱敏）
+// v12：从 App 自身签名/建请求链路观测到的真实参数（用来和 DL Music 那套对照）
+static NSString *KGAppToken = nil, *KGAppUid = nil, *KGAppDfid = nil, *KGAppMid = nil;
+static NSString *KGAppAppid = nil, *KGAppClientver = nil, *KGAppSalt = nil;
+static NSString *KGNetObsReport = @"";
+static BOOL H_SignA = NO, H_SignB = NO, H_DaoKey = NO, H_DaoInfo = NO;
+static IMP KGOrigSignA = NULL, KGOrigSignB = NULL, KGOrigDaoKey = NULL, KGOrigDaoInfo = NULL;
 
 // ---------- 工具 ----------
 static NSString *KGMD5(NSString *in) {
@@ -80,12 +86,121 @@ static void KGLogReq(NSString *url) {
     }
 }
 
+static NSString *KGSign(NSDictionary *params);
+static NSString *KGCurSalt(void);
+
+static NSString *KGUnesc(NSString *s) {
+    if (s.length == 0) { return @""; }
+    return [s stringByRemovingPercentEncoding] ?: s;
+}
+
+static NSDictionary *KGQueryDict(NSString *url) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    NSRange r = [url rangeOfString:@"?"];
+    if (r.location == NSNotFound) { return d; }
+    NSString *q = [url substringFromIndex:r.location + 1];
+    NSRange frag = [q rangeOfString:@"#"];
+    if (frag.location != NSNotFound) { q = [q substringToIndex:frag.location]; }
+    for (NSString *kv in [q componentsSeparatedByString:@"&"]) {
+        NSRange e = [kv rangeOfString:@"="];
+        if (e.location == NSNotFound) { continue; }
+        NSString *k = [kv substringToIndex:e.location];
+        NSString *v = KGUnesc([kv substringFromIndex:e.location + 1]);
+        if (k.length) { d[k] = v; }
+    }
+    return d;
+}
+
+static BOOL KGUsable(NSString *s) {
+    return (s.length > 0 && ![s isEqualToString:@"-"] && ![s isEqualToString:@"0"]);
+}
+
+// 观测 App 自己构造的（已签名）请求，抓真实 token/dfid/mid/appid/salt
+static int KGObsUrlCount = 0;
+static int KGObsDictCount = 0;
+
+static void KGObserveURL(NSString *url, NSString *saltHint) {
+    if (url.length < 10) { return; }
+    if (saltHint.length >= 16 && ![saltHint isEqualToString:@"-"]) { KGAppSalt = saltHint; }
+    if (KGObsUrlCount > 400) { return; }
+    KGObsUrlCount++;
+    NSDictionary *p = KGQueryDict(url);
+    if (p.count == 0) { return; }
+    NSString *t = KGStr(p[@"token"]);
+    if (t.length >= 32) { KGAppToken = t; }
+    NSString *u = KGStr(p[@"userid"]); if (u.length == 0) { u = KGStr(p[@"kugouid"]); }
+    if (KGUsable(u)) { KGAppUid = u; }
+    NSString *df = KGStr(p[@"dfid"]); if (df.length == 0) { df = KGStr(p[@"dfid2"]); }
+    if (KGUsable(df)) { KGAppDfid = df; }
+    NSString *md = KGStr(p[@"mid"]);
+    if (KGUsable(md)) { KGAppMid = md; }
+    NSString *ap = KGStr(p[@"appid"]);
+    if (KGUsable(ap)) { KGAppAppid = ap; }
+    NSString *cv = KGStr(p[@"clientver"]);
+    if (KGUsable(cv)) { KGAppClientver = cv; }
+    // 记录一条（脱敏 token，其余原样，用于对比 App 真实参数）
+    NSString *path = url;
+    NSRange qr = [path rangeOfString:@"?"];
+    if (qr.location != NSNotFound) { path = [path substringToIndex:qr.location]; }
+    if (path.length > 130) { path = [path substringToIndex:130]; }
+    NSMutableArray *kv = [NSMutableArray array];
+    for (NSString *k in @[@"dfid", @"mid", @"appid", @"clientver", @"userid", @"kugouid", @"source_id", @"receive_day", @"ad_type", @"signature"]) {
+        NSString *v = KGStr(p[k]);
+        if (v.length == 0) { continue; }
+        if ([k isEqualToString:@"signature"] && v.length > 12) { v = [v substringToIndex:12]; }
+        [kv addObject:[NSString stringWithFormat:@"%@=%@", k, v]];
+    }
+    NSString *sig = KGStr(p[@"signature"]);
+    if (sig.length >= 32) {
+        NSMutableDictionary *q = [NSMutableDictionary dictionaryWithDictionary:p];
+        [q removeObjectForKey:@"signature"];
+        NSString *mine = KGSign(q);
+        [kv addObject:[NSString stringWithFormat:@"sigMatch=%@", [[mine lowercaseString] isEqualToString:[sig lowercaseString]] ? @"Y" : @"N"]];
+    }
+    KGLogReq([NSString stringWithFormat:@"%@ | tok=%@ | %@", path, KGMaskToken(t), [kv componentsJoinedByString:@"&"]]);
+}
+
+// 优先用从 App 自身签名链路观测到的配置（salt/appid/clientver/dfid/mid）
+static NSString *KGCurSalt(void) { return (KGAppSalt.length >= 16) ? KGAppSalt : KG_SALT; }
+static NSString *KGCurAppid(void) { return KGAppAppid.length ? KGAppAppid : KG_APPID; }
+static NSString *KGCurCver(void) { return KGAppClientver.length ? KGAppClientver : KG_CLIENTVER; }
+static NSString *KGCurDfid(void) { return KGAppDfid.length ? KGAppDfid : @"-"; }
+static NSString *KGCurMid(void) { return KGAppMid.length ? KGAppMid : KG_MID; }
+
+// 观测 App 的参数 dict（signFill 的输入）
+static void KGObserveDict(id dict, NSString *salt, NSString *appid) {
+    if (salt.length >= 16 && ![salt isEqualToString:@"-"]) { KGAppSalt = salt; }
+    if (KGUsable(appid)) { KGAppAppid = appid; }
+    if (KGObsDictCount > 400) { return; }
+    KGObsDictCount++;
+    if (![dict isKindOfClass:NSDictionary.class]) { return; }
+    NSDictionary *p = dict;
+    NSString *t = KGStr(p[@"token"]);
+    if (t.length >= 32) { KGAppToken = t; }
+    NSString *u = KGStr(p[@"userid"]); if (u.length == 0) { u = KGStr(p[@"kugouid"]); }
+    if (KGUsable(u)) { KGAppUid = u; }
+    NSString *df = KGStr(p[@"dfid"]);
+    if (KGUsable(df)) { KGAppDfid = df; }
+    NSString *md = KGStr(p[@"mid"]);
+    if (KGUsable(md)) { KGAppMid = md; }
+    NSString *cv = KGStr(p[@"clientver"]);
+    if (KGUsable(cv)) { KGAppClientver = cv; }
+    if (KGUsable(KGStr(p[@"appid"]))) { KGAppAppid = KGStr(p[@"appid"]); }
+    NSString *skey = KGStr(p[@"source_id"]);
+    if (skey.length || KGStr(p[@"receive_day"]).length) {
+        KGLogReq([NSString stringWithFormat:@"[dict] tok=%@ src=%@ day=%@ dfid=%@ mid=%@ appid=%@ salt=%@",
+                  KGMaskToken(t), skey, KGStr(p[@"receive_day"]), KGStr(p[@"dfid"]),
+                  KGStr(p[@"mid"]), KGStr(p[@"appid"]), salt.length ? salt : @"-"]);
+    }
+}
+
 static NSString *KGSign(NSDictionary *params) {
+    NSString *salt = KGCurSalt();
     NSMutableString *s = [NSMutableString string];
     for (NSString *k in [params.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
         [s appendFormat:@"%@=%@", k, params[k]];
     }
-    return KGMD5([NSString stringWithFormat:@"%@%@%@", KG_SALT, s, KG_SALT]);
+    return KGMD5([NSString stringWithFormat:@"%@%@%@", salt, s, salt]);
 }
 
 static void KGSaveCreds(NSString *token, NSString *userid) {
@@ -135,18 +250,61 @@ static void KGVipAlert(NSString *msg) {
     });
 }
 
+static NSString *KGVDesc(id v) {
+    if (!v || v == (id)NSNull.null) { return @"(nil)"; }
+    if ([v isKindOfClass:NSString.class]) {
+        NSString *x = (NSString *)v;
+        if (x.length > 24) { return [NSString stringWithFormat:@"%@..(%lu)", [x substringToIndex:12], (unsigned long)x.length]; }
+        return x;
+    }
+    if ([v isKindOfClass:NSNumber.class]) { return [(NSNumber *)v stringValue]; }
+    NSString *d = [v description] ?: @"";
+    if (d.length > 44) { return [NSString stringWithFormat:@"%@..(%lu)", [d substringToIndex:20], (unsigned long)d.length]; }
+    return d;
+}
+
 // ---------- 诊断文件 ----------
 static void KGWriteDiag(NSString *extra) {
     NSMutableString *s = [NSMutableString string];
     NSDateFormatter *f = [[NSDateFormatter alloc] init];
     f.dateFormat = @"MM-dd HH:mm:ss";
     [s appendFormat:@"=== %@ %@ ===\n", KG_VER, [f stringFromDate:[NSDate date]]];
-    [s appendFormat:@"hooks: login=%@ envInit=%@ envTok=%@ af=%@ common=%@ res=%@\n",
+    [s appendFormat:@"hooks: login=%@ envInit=%@ envTok=%@ af=%@ common=%@ res=%@ signA=%@ signB=%@ daokey=%@ daoinfo=%@\n",
         H_Login?@"OK":@"MISS", H_EnvInit?@"OK":@"MISS", H_EnvTok?@"OK":@"MISS",
-        H_AF?@"OK":@"MISS", H_Common?@"OK":@"MISS", H_Res?@"OK":@"MISS"];
+        H_AF?@"OK":@"MISS", H_Common?@"OK":@"MISS", H_Res?@"OK":@"MISS",
+        H_SignA?@"OK":@"MISS", H_SignB?@"OK":@"MISS", H_DaoKey?@"OK":@"MISS", H_DaoInfo?@"OK":@"MISS"];
     NSString *token = nil, *uid = nil;
     @synchronized (KGCreds) { token = KGCreds[@"token"]; uid = KGCreds[@"userid"]; }
     [s appendFormat:@"creds: tokLen=%lu uid=%@\n", (unsigned long)(token ? token.length : 0), uid.length ? uid : @"-"];
+    // 从 App 自身签名/建请求链路观测到的真实配置（探索性）
+    [s appendFormat:@"netsign: salt=%@ appid=%@ clientver=%@\n", KGAppSalt.length ? KGAppSalt : @"-",
+        KGAppAppid.length ? KGAppAppid : @"-", KGAppClientver.length ? KGAppClientver : @"-"];
+    [s appendFormat:@"netsign: tok=%@ uid=%@ dfid=%@ mid=%@\n",
+        KGAppToken.length ? KGMaskToken(KGAppToken) : @"-",
+        KGAppUid.length ? KGAppUid : @"-",
+        KGAppDfid.length ? KGAppDfid : @"-",
+        KGAppMid.length ? KGAppMid : @"-"];
+    // 概念版用户状态的键（脱敏）
+    {
+        id st = [[NSUserDefaults standardUserDefaults] objectForKey:@"YouthUserStateInfoKey"];
+        [s appendString:@"ystate: "];
+        if (!st) { [s appendString:@"(nil)\n"]; }
+        else if ([st isKindOfClass:NSDictionary.class]) {
+            NSDictionary *d = st;
+            [s appendFormat:@"dict %lu keys: ", (unsigned long)d.count];
+            for (NSString *k in [[d allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+                id v = d[k];
+                NSString *vs = KGVDesc(v);
+                [s appendFormat:@"%@=%@ ", k, vs];
+            }
+            [s appendString:@"\n"];
+        } else if ([st isKindOfClass:NSData.class]) {
+            [s appendFormat:@"NSData(%lu)\n", (unsigned long)[(NSData *)st length]];
+        } else {
+            NSString *vs = KGVDesc(st);
+            [s appendFormat:@"%@ %@\n", NSStringFromClass([st class]), vs];
+        }
+    }
     // 类存在性
     NSArray *names = @[@"KGSVUserInfoManager", @"KGEnvironment", @"AFHTTPSessionManager",
                        @"KGCommonParamDao", @"KGHistoryUserTokenManager", @"KTVUserManager",
@@ -315,11 +473,11 @@ static NSString *KGEnc(NSString *v) {
 
 static void KGPost(NSString *path, NSMutableDictionary *params,
                    void (^done)(NSDictionary *json, NSError *err)) {
-    params[@"dfid"] = @"-";
+    params[@"dfid"] = KGCurDfid();
     params[@"uuid"] = @"-";
-    params[@"mid"] = KG_MID;
-    params[@"appid"] = KG_APPID;
-    params[@"clientver"] = KG_CLIENTVER;
+    params[@"mid"] = KGCurMid();
+    params[@"appid"] = KGCurAppid();
+    params[@"clientver"] = KGCurCver();
     NSString *ct = [NSString stringWithFormat:@"%d", (int)[NSDate date].timeIntervalSince1970];
     params[@"clienttime"] = ct;
     params[@"signature"] = KGSign(params);
@@ -333,8 +491,8 @@ static void KGPost(NSString *path, NSMutableDictionary *params,
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
     req.HTTPMethod = @"POST";
     [req setValue:KG_UA forHTTPHeaderField:@"User-Agent"];
-    [req setValue:@"-" forHTTPHeaderField:@"dfid"];
-    [req setValue:KG_MID forHTTPHeaderField:@"mid"];
+    [req setValue:KGCurDfid() forHTTPHeaderField:@"dfid"];
+    [req setValue:KGCurMid() forHTTPHeaderField:@"mid"];
     [req setValue:ct forHTTPHeaderField:@"clienttime"];
     [req setValue:@"1" forHTTPHeaderField:@"kg-rc"];
     [req setValue:@"5d816a0" forHTTPHeaderField:@"kg-thash"];
@@ -355,11 +513,11 @@ static void KGPost(NSString *path, NSMutableDictionary *params,
 
 static void KGGet(NSString *path, NSMutableDictionary *params,
                   void (^done)(NSDictionary *json, NSError *err)) {
-    params[@"dfid"] = @"-";
+    params[@"dfid"] = KGCurDfid();
     params[@"uuid"] = @"-";
-    params[@"mid"] = KG_MID;
-    params[@"appid"] = KG_APPID;
-    params[@"clientver"] = KG_CLIENTVER;
+    params[@"mid"] = KGCurMid();
+    params[@"appid"] = KGCurAppid();
+    params[@"clientver"] = KGCurCver();
     NSString *ct = [NSString stringWithFormat:@"%d", (int)[NSDate date].timeIntervalSince1970];
     params[@"clienttime"] = ct;
     params[@"signature"] = KGSign(params);
@@ -372,8 +530,8 @@ static void KGGet(NSString *path, NSMutableDictionary *params,
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
     req.HTTPMethod = @"GET";
     [req setValue:KG_UA forHTTPHeaderField:@"User-Agent"];
-    [req setValue:@"-" forHTTPHeaderField:@"dfid"];
-    [req setValue:KG_MID forHTTPHeaderField:@"mid"];
+    [req setValue:KGCurDfid() forHTTPHeaderField:@"dfid"];
+    [req setValue:KGCurMid() forHTTPHeaderField:@"mid"];
     [req setValue:ct forHTTPHeaderField:@"clienttime"];
     req.timeoutInterval = 15;
 
@@ -506,6 +664,10 @@ static void KGAddCand(NSMutableArray *out, NSString *src, id tv, id uv) {
 
 static NSMutableArray *KGCollectCandidates(void) {
     NSMutableArray *out = [NSMutableArray array];
+    // App 自身真实请求里观测到的 token 优先级最高
+    if (KGAppToken.length >= 32 && KGAppUid.length > 0) {
+        KGAddCand(out, @"AppObserved", KGAppToken, KGAppUid);
+    }
     @synchronized (KGCreds) { KGAddCand(out, @"creds", KGCreds[@"token"], KGCreds[@"userid"]); }
 
     id ktv = KGInstanceOf(@"KTVUserManager");
@@ -682,12 +844,27 @@ static void KGDoUpgrade(void) {
     });
 }
 
+static BOOL KGSyncFromObserved(void) {
+    if (KGAppToken.length < 32 || KGAppUid.length == 0) { return NO; }
+    NSString *cur = nil;
+    @synchronized (KGCreds) { cur = KGCreds[@"token"]; }
+    if ([cur isEqualToString:KGAppToken]) { return YES; }
+    @synchronized (KGCreds) {
+        KGCreds[@"token"] = KGAppToken;
+        KGCreds[@"userid"] = KGAppUid;
+        KGCredsLoaded = YES;
+        [[NSUserDefaults standardUserDefaults] setObject:[KGCreds copy] forKey:KG_CREDS_KEY];
+    }
+    return YES;
+}
+
 static void KGAutoClaimTick(BOOL verbose) {
     if (KGDoneToday) { return; }
     KGLoadCreds();
     KGReadCredsFile();
     KGReadHistoryToken();
     KGReadLoginManager();
+    KGSyncFromObserved();
     if (KGLastEnv) {
         @try {
             NSString *t = KGStr(((id(*)(id, SEL))objc_msgSend)(KGLastEnv, sel_registerName("token")));
@@ -877,6 +1054,92 @@ static void KGInstallHooksOnce(void) {
             H_Res = (KGOrigRes != NULL);
         }
     }
+    // 6) KGNetworkTools 签名/拼参（App 自己算签名的地方，能拿到真实 salt/appid/dfid/token）
+    if (!H_SignA) {
+        Class nc = objc_getClass("KGNetworkTools");
+        SEL s = sel_registerName("signFillUrlCustomParameterDictionary:bodyString:isCdnRequest:signature:appid:saltKey:is256Sign:");
+        Method m = nc ? class_getInstanceMethod(nc, s) : NULL;
+        if (m) {
+            IMP ni = imp_implementationWithBlock(^(id self, id dict, id body, BOOL isCdn, id *sigOut,
+                                                   id appid, id salt, BOOL is256) {
+                id r = nil;
+                if (KGOrigSignA) {
+                    r = ((id(*)(id, SEL, id, id, BOOL, id*, id, id, BOOL))KGOrigSignA)
+                        (self, s, dict, body, isCdn, sigOut, appid, salt, is256);
+                }
+                @try {
+                    KGObserveDict(dict, KGStr(salt), KGStr(appid));
+                    if ([r isKindOfClass:NSString.class]) { KGObserveURL(r, KGStr(salt)); }
+                } @catch (__unused NSException *ex) {}
+                return r;
+            });
+            KGOrigSignA = method_setImplementation(m, ni);
+            H_SignA = (KGOrigSignA != NULL);
+        }
+    }
+    if (!H_SignB) {
+        Class nc = objc_getClass("KGNetworkTools");
+        SEL s = sel_registerName("signFillUrlCustomParameterDictionary:bodyString:isCdnRequest:signature:saltKey:is256Sign:");
+        Method m = nc ? class_getInstanceMethod(nc, s) : NULL;
+        if (m) {
+            IMP ni = imp_implementationWithBlock(^(id self, id dict, id body, BOOL isCdn, id *sigOut,
+                                                   id salt, BOOL is256) {
+                id r = nil;
+                if (KGOrigSignB) {
+                    r = ((id(*)(id, SEL, id, id, BOOL, id*, id, BOOL))KGOrigSignB)
+                        (self, s, dict, body, isCdn, sigOut, salt, is256);
+                }
+                @try {
+                    KGObserveDict(dict, KGStr(salt), nil);
+                    if ([r isKindOfClass:NSString.class]) { KGObserveURL(r, KGStr(salt)); }
+                } @catch (__unused NSException *ex) {}
+                return r;
+            });
+            KGOrigSignB = method_setImplementation(m, ni);
+            H_SignB = (KGOrigSignB != NULL);
+        }
+    }
+    // 7) BaseHttpDao 建请求（返回 NSURLRequest，URL 里就是最终参数）
+    if (!H_DaoKey) {
+        Class dc = objc_getClass("BaseHttpDao");
+        SEL s = sel_registerName("createRequestWithKey:AndFillUrl:AndReurnType:AndHeader:AndIsPost:");
+        Method m = dc ? class_getInstanceMethod(dc, s) : NULL;
+        if (m) {
+            IMP ni = imp_implementationWithBlock(^(id self, id key, id url, int rt, id hdr, BOOL isPost) {
+                id r = nil;
+                if (KGOrigDaoKey) { r = ((id(*)(id, SEL, id, id, int, id, BOOL))KGOrigDaoKey)(self, s, key, url, rt, hdr, isPost); }
+                @try {
+                    if ([r isKindOfClass:NSURLRequest.class]) { KGObserveURL([[(NSURLRequest *)r URL] absoluteString], nil); }
+                    else if ([r isKindOfClass:NSString.class]) { KGObserveURL((NSString *)r, nil); }
+                    if ([url isKindOfClass:NSString.class] && [(NSString *)url containsString:@"?"]) { KGObserveURL((NSString *)url, nil); }
+                } @catch (__unused NSException *ex) {}
+                return r;
+            });
+            KGOrigDaoKey = method_setImplementation(m, ni);
+            H_DaoKey = (KGOrigDaoKey != NULL);
+        }
+    }
+    if (!H_DaoInfo) {
+        Class dc = objc_getClass("BaseHttpDao");
+        SEL s = sel_registerName("createRequestWithGetMethodInfo:AndIsPost:");
+        Method m = dc ? class_getInstanceMethod(dc, s) : NULL;
+        if (m) {
+            IMP ni = imp_implementationWithBlock(^(id self, id info, BOOL isPost) {
+                id r = nil;
+                if (KGOrigDaoInfo) { r = ((id(*)(id, SEL, id, BOOL))KGOrigDaoInfo)(self, s, info, isPost); }
+                @try {
+                    if ([r isKindOfClass:NSURLRequest.class]) { KGObserveURL([[(NSURLRequest *)r URL] absoluteString], nil); }
+                    NSString *d = info ? [info description] : nil;
+                    if (d.length && ([d containsString:@"youth"] || [d containsString:@"recharge"] || [d containsString:@"vip"])) {
+                        KGLogReq([NSString stringWithFormat:@"[info] %@", (d.length > 260 ? [d substringToIndex:260] : d)]);
+                    }
+                } @catch (__unused NSException *ex) {}
+                return r;
+            });
+            KGOrigDaoInfo = method_setImplementation(m, ni);
+            H_DaoInfo = (KGOrigDaoInfo != NULL);
+        }
+    }
 }
 
 static void KGScheduleHookRetry(int left) {
@@ -904,11 +1167,13 @@ static void KGBootstrap(void) {
         KGReadCredsFile();
         KGReadHistoryToken();
         KGReadLoginManager();
+        KGSyncFromObserved();
         NSString *token = nil, *userid = nil;
         @synchronized (KGCreds) { token = KGCreds[@"token"]; userid = KGCreds[@"userid"]; }
         if (token.length > 0 && userid.length > 0 && !announced) {
             announced = YES;
-            KGVipAlert([NSString stringWithFormat:@"凭据已采集(%@)，5 秒后自动领取", KG_VER]);
+            KGVipAlert([NSString stringWithFormat:@"凭据已采集(%@)，5 秒后自动领取\nsalt=%@ appid=%@", KG_VER,
+                        KGCurSalt().length > 12 ? [KGCurSalt() substringToIndex:12] : KGCurSalt(), KGCurAppid()]);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ KGDoClaim(); });
         }
