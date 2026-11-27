@@ -313,6 +313,62 @@ static void KGInstallHomeFixedHook(void) {
     free(list);
 }
 
+/* ============ v9h: 视图树定期扫描（换实现方式，不靠方法 hook） ============
+ * 「赚钱」入口不走 willDisplay、方法 hook 也不命中，彻底换思路：
+ * 定时扫描可见 window 的整棵视图树，发现文字命中关键词的 UILabel，
+ * 就把它的入口容器（向上第一个有实际尺寸的祖先）整体隐藏。
+ * 不依赖类名和 hook 命中，所见即所得；已隐藏子树自动剪枝。 */
+static void KGScanAndHideEntryViews(UIView *view, NSInteger depth) {
+    if (!view || view.hidden || view.alpha <= 0.01 || depth > 24) { return; }
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        if (KGTextMatches(label.text) || KGTextMatches(label.attributedText.string)) {
+            /* 向上找最多 3 层，第一个有实际尺寸（>40x20）的祖先即入口容器 */
+            UIView *target = label;
+            UIView *parent = label.superview;
+            for (int i = 0; parent && i < 3; i++) {
+                CGSize s = parent.frame.size;
+                if (s.width > 40 && s.height > 20) { target = parent; break; }
+                parent = parent.superview;
+            }
+            KGHideView(target);
+            KGLogAlways(@"entry scan hidden: %@ in %@", NSStringFromClass([target class]),
+                        NSStringFromClass([KGViewControllerForView(target) class] ?: [NSObject class]));
+            return;
+        }
+    }
+    for (UIView *sub in view.subviews) { KGScanAndHideEntryViews(sub, depth + 1); }
+}
+
+static void KGScanAllWindows(void) {
+    KGInitRuntimeState();
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (!w.hidden) { KGScanAndHideEntryViews(w, 0); }
+    }
+}
+
+static NSTimer *KGEntryScanTimer = nil;
+static NSInteger KGEntryScanTicks = 0;
+static void KGStartEntryScanTimer(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        KGEntryScanTimer = [NSTimer scheduledTimerWithTimeInterval:1.5
+                                                            repeats:YES
+                                                              block:^(NSTimer *timer) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                KGScanAllWindows();
+            });
+            if (++KGEntryScanTicks >= 240) {   /* 1.5s × 240 = 6 分钟 */
+                [timer invalidate];
+                KGEntryScanTimer = nil;
+            }
+        }];
+        if (KGEntryScanTimer) {
+            [[NSRunLoop mainRunLoop] addTimer:KGEntryScanTimer forMode:NSRunLoopCommonModes];
+        }
+    });
+}
+
 static void KGCallCB(id cb) {
     if (cb) { ((KGSuccessCB)cb)(nil); }
 }
@@ -623,10 +679,10 @@ static KGSelHook kSelHooks[] = {
     {"goToTaskCenterWithSourceId:actionType:taskId:giftId:animated:", (IMP)KGNoopNil},
     {"refreshBottomTaskCenterView:", (IMP)KGNoopNil},
     {"setBottomTaskCenterView:", (IMP)KGNoop},
-    /* v9d: 不再置空 earnMoneyUrlStr —— 会让赚钱页 URL=nil 一直转圈。
-     * v9f: 赚钱入口不走 willDisplay 路径，改拦任务入口 view 的
-     * 真实显示/点击方法（showTaskView / clickTaskView 等），
-     * 入口根本不显示，自然点不进去。 */
+    /* v9h: 退路恢复——置空 earnMoneyUrlStr，入口万一漏网，点进去也是拼命加载中 */
+    {"earnMoneyUrlStr", (IMP)KGNoopNil},
+    /* v9f: 任务入口 view 的真实显示/点击（方法 hook 对入口不一定命中，
+     * v9g 起由视图树扫描兜底做视觉隐藏） */
     {"showTaskView", (IMP)KGNoopNil},
     {"clickTaskView", (IMP)KGNoopNil},
     {"checkShowTaskView", (IMP)KGNoopNil},
@@ -774,12 +830,13 @@ static void KGStartSlowHookTimer(void) {
     /* 1. 立刻挂一次（类已在内存时直接生效）——只跑快批次 */
     KGInstallAllHooks();
 
-    /* 2. 主线程下一个 loop 再挂（覆盖 guest App 刚 dlopen 的情况），并启动 cell hook / 慢批次重试定时器 */
+    /* 2. 主线程下一个 loop 再挂（覆盖 guest App 刚 dlopen 的情况），并启动各重试定时器 */
     dispatch_async(dispatch_get_main_queue(), ^{
         KGInstallAllHooks();
         KGStartCardHookTimer();
         KGStartSlowHookTimer();
         KGInstallHomeFixedHook();
+        KGStartEntryScanTimer();
     });
 
     /* 3. App 启动完成时再挂一次——仍然只跑快批次 */
