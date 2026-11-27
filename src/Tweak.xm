@@ -10,6 +10,8 @@
  *  - v4：v3 只拦了「检查」入口，实际弹窗由 show* 方法绘制，导致 VIP 到期弹窗和
  *    签到弹窗仍出现。补拦真实显示方法：showAlertWithIsExpire:days:、
  *    realShowV3WithIsExpire:days:、showCalendarSignInAlert: 等。
+ *  - v5-B：精简引导浮层（GuideView），拦 showGuideView/showSlideGuide 等
+ *    真实显示方法；避开带 complete block 的方法防止回调不触发卡流程。
  */
 
 @import Foundation;
@@ -138,6 +140,49 @@ static KGSelHook kSelHooks[] = {
     {"showMyPageTaskCenterSignIn", (IMP)KGNoopNil},
     {"canShowCanlendarSignInAlert", (IMP)KGNoopNil},
     {"checkShowCalendarSignInAlertWithFirstPlay", (IMP)KGNoopNil},
+
+    /* v5-B: 引导浮层（GuideView）真实显示方法。
+     * 只挑 show*/p_show* 这类真正绘制的方法；避开带 complete:/endShow block 的
+     * （拦了不调 block 会让流程卡住）。中风险：首次用某功能会没提示，但功能本身可用。 */
+    {"showGuide", (IMP)KGNoopNil},
+    {"showGuideView", (IMP)KGNoopNil},
+    {"showGuideView:", (IMP)KGNoopNil},
+    {"showGuideViewIfNeeded", (IMP)KGNoopNil},
+    {"showGuideViewInShareSheet", (IMP)KGNoopNil},
+    {"showGuideAlertViewWithExtraAward:", (IMP)KGNoopNil},
+    {"showSlideGuide", (IMP)KGNoopNil},
+    {"showNextPlayGuideView", (IMP)KGNoopNil},
+    {"showPlayDiyEntranceGuide", (IMP)KGNoopNil},
+    {"showPlayDiyEntranceGuideSheet:", (IMP)KGNoopNil},
+    {"showPlayerModeUpgradeGuideIfNeeded", (IMP)KGNoopNil},
+    {"showPlayerPriviledgeGuideSheet:", (IMP)KGNoopNil},
+    {"showPlayerPriviledgeAdGuideAlert", (IMP)KGNoopNil},
+    {"showDetailGuide:", (IMP)KGNoopNil},
+    {"showShareGuideView", (IMP)KGNoopNil},
+    {"showLyricMakeToolGuide", (IMP)KGNoopNil},
+    {"showCardPointGuideView", (IMP)KGNoopNil},
+    {"showAIRadioGuideAlertView", (IMP)KGNoopNil},
+    {"showHiresGuideAlert", (IMP)KGNoopNil},
+    {"showPubshNotiGuideAlert", (IMP)KGNoopNil},
+    {"showPubshNotiGuideAlert:", (IMP)KGNoopNil},
+    {"showAdvertNotiGuideAlert:", (IMP)KGNoopNil},
+    {"p_showNewCreationGuideAlertView", (IMP)KGNoopNil},
+    {"p_showPlayDiyEntranceGuideSheet", (IMP)KGNoopNil},
+    {"p_showPlayPostMoveGuideSheet", (IMP)KGNoopNil},
+    {"p_showTaskCenterGuideAlertView", (IMP)KGNoopNil},
+    {"checkAndShowGuideIfNeeded", (IMP)KGNoopNil},
+    {"checkAndShowEditGuide", (IMP)KGNoopNil},
+    {"checkAndShowLongPressGuide", (IMP)KGNoopNil},
+    {"checkAndShowHiresGuideAlert", (IMP)KGNoopNil},
+    {"checkShowGuide", (IMP)KGNoopNil},
+    {"checkShowGuideTips", (IMP)KGNoopNil},
+    {"checkShowGuideView", (IMP)KGNoopNil},
+    {"checkToShowGuideView", (IMP)KGNoopNil},
+    {"checkGuideViewShow", (IMP)KGNoopNil},
+    {"canShowGuideView", (IMP)KGNoopNil},
+    {"canShowGuideAlert", (IMP)KGNoopNil},
+    {"checkShowAutoGuide", (IMP)KGNoopNil},
+    {"delayShowLyricHandbookGuide", (IMP)KGNoopNil},
 };
 static const NSUInteger kSelHookCount = sizeof(kSelHooks) / sizeof(kSelHooks[0]);
 
