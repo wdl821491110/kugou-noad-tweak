@@ -10,7 +10,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 
-#define KG_VER   @"v16b"
+#define KG_VER   @"v16c"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"
@@ -26,6 +26,7 @@
 static NSMutableDictionary *KGCreds = nil;
 static BOOL KGCredsLoaded = NO;
 static BOOL KGDoneToday = NO;
+static BOOL KGReceiveDone = NO, KGUpgradeDone = NO;   // v16c：每次启动只发一次，避免重复 POST 触发风控
 static IMP KGOrigLoginSetter = NULL;
 static IMP KGOrigEnvInit = NULL;
 static IMP KGOrigEnvTok = NULL;
@@ -1145,7 +1146,7 @@ static void KGDoClaim(void);
 static void KGDoUpgrade(void);
 
 static void KGDoClaim(void) {
-    if (KGDoneToday) { return; }
+    if (KGDoneToday || KGReceiveDone) { return; }
     static BOOL inflight = NO;
     if (inflight) { return; }
     NSString *token = nil, *userid = nil;
@@ -1178,6 +1179,7 @@ static void KGDoClaim(void) {
         }
         BOOL kgFail = ([msg hasPrefix:@"签到失败"] || [msg hasPrefix:@"签到网络错误"]);
         BOOL kgNoop = [msg isEqualToString:@"今天已签到"];
+        if (!err) { KGReceiveDone = YES; }   // 服务端已给业务答复，不再重复发
         static BOOL kgFailAlerted = NO;
         if (kgNoop) {
             // 131001 说明 token 已被服务端接受（否则只会是 51002/20018/20006），方案成立
@@ -1197,6 +1199,7 @@ static void KGDoClaim(void) {
 }
 
 static void KGDoUpgrade(void) {
+    if (KGUpgradeDone) { return; }
     NSString *userid = nil, *token = nil;
     @synchronized (KGCreds) { userid = KGCreds[@"userid"]; token = KGCreds[@"token"]; }
     NSMutableDictionary *p = [NSMutableDictionary dictionary];
@@ -1222,6 +1225,7 @@ static void KGDoUpgrade(void) {
         }
         BOOL kgFail = ([msg hasPrefix:@"升级失败"] || [msg hasPrefix:@"升级网络错误"]);
         BOOL kgNoop = ([msg isEqualToString:@"今天已签到"] || [msg isEqualToString:@"今天已升级"]);
+        if (!err) { KGUpgradeDone = YES; }
         static BOOL kgUpFailAlerted = NO;
         if (!kgNoop && (!kgFail || !kgUpFailAlerted)) {
             if (kgFail) { kgUpFailAlerted = YES; }
