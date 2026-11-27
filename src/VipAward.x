@@ -62,7 +62,9 @@ static void KGLoadCreds(void) {
     @synchronized (KGCreds) {
         if (KGCredsLoaded) { return; }
         NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:KG_CREDS_KEY];
-        if (d[@"token"].length > 0 && d[@"userid"].length > 0) {
+        NSString *t = KGStr(d[@"token"]);
+        NSString *u = KGStr(d[@"userid"]);
+        if (t.length > 0 && u.length > 0) {
             [KGCreds addEntriesFromDictionary:d];
             KGCredsLoaded = YES;
         }
@@ -75,7 +77,7 @@ static void KGVipAlert(NSString *msg) {
         UIViewController *root = nil;
         for (__kindof UIWindowScene *sc in [UIApplication sharedApplication].connectedScenes) {
             if (sc.activationState != UISceneActivationStateForegroundActive) { continue; }
-            for (UIWindow *w in [sc windows reverseObjectEnumerator].allObjects) {
+            for (UIWindow *w in sc.windows) {
                 if (!w.rootViewController) { continue; }
                 root = w.rootViewController;
                 break;
@@ -234,7 +236,7 @@ static void KGAutoClaimTick(BOOL verbose) {
     KGLoadCreds();
     KGReadLoginManager();
     @synchronized (KGCreds) {
-        if (KGCreds[@"token"].length == 0 || KGCreds[@"userid"].length == 0) {
+        if (KGStr(KGCreds[@"token"]).length == 0 || KGStr(KGCreds[@"userid"]).length == 0) {
             KGScanUserDefaults();
         }
     }
@@ -246,7 +248,8 @@ static void KGAutoClaimTick(BOOL verbose) {
         // 诊断：报告具体缺什么
         Class c = objc_getClass("KGSVUserInfoManager");
         BOOL hasInst = NO, login = NO;
-        NSString *tokLen = @"-", kid = @"-";
+        NSString *tokLen = @"-";
+        NSString *kid = @"-";
         if (c) {
             id inst = ((id(*)(id, SEL))objc_msgSend)((id)c, sel_registerName("shareInstance"));
             if (inst) {
