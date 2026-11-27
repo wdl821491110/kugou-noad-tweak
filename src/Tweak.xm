@@ -66,7 +66,7 @@ static void KGInitRuntimeState(void) {
             @"TA也喜欢", @"ta也喜欢", @"TA特喜欢", @"ta特喜欢",
             @"概念er新推", @"概念实验室", @"曲风盲盒", @"VIP专属", @"小众宝藏",
             @"赚钱", @"赚金币", @"赚概念币", @"任务中心",
-            @"频道推荐", @"免费听", @"潮流尝鲜"
+            @"频道推荐", @"潮流尝鲜"
         ];
     });
 }
@@ -117,32 +117,6 @@ static BOOL KGViewTextMatches(UIView *view, NSInteger depth) {
 static void KGHideView(UIView *view) {
     if (view.hidden != YES) { view.hidden = YES; }
     if (view.alpha != 0.0) { view.alpha = 0.0; }
-}
-
-/* ============ v9g: 隐藏白名单（防关键词误伤） ============
- * 免费听页（YouthAIFreeTabViewController）自身元素含「免费听」文字，
- * 全局 willDisplay 隐藏会把整个页面误杀成空白。
- * 只允许在首页 / 发现页 / 我的页的列表容器里做关键词隐藏。 */
-static UIViewController *KGViewControllerForView(UIView *view) {
-    UIResponder *r = view;
-    while (r && ![r isKindOfClass:[UIViewController class]]) { r = r.nextResponder; }
-    return (UIViewController *)r;
-}
-
-static BOOL KGContainerAllowsHiding(UIView *container) {
-    UIViewController *vc = KGViewControllerForView(container);
-    if (!vc) { return NO; }
-    NSString *name = NSStringFromClass([vc class]);
-    static NSArray *prefixes = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        prefixes = @[@"KGYouthHome", @"KGYouthDiscover", @"KGYouthNewDiscover",
-                     @"YouthNewDiscover", @"KGYouthMine", @"YouthHomeMine"];
-    });
-    for (NSString *p in prefixes) {
-        if ([name hasPrefix:p]) { return YES; }
-    }
-    return NO;
 }
 
 /* ============ v8/v9: 首页运营卡片 + 任务入口 view 运行时隐藏 ============
@@ -261,114 +235,6 @@ static void KGStartCardHookTimer(void) {
     });
 }
 
-/* ============ v9g: 首页固定不滑动 ============
- * 用户要求首页固定、不能上下滑动。类级 hook KGYouthHomeController 的
- * viewDidAppear:，先调父类实现（本类无实现时从父类拿），再递归把
- * 视图树里的 UIScrollView 全部 scrollEnabled=NO。 */
-static void KGDisableScrolling(UIView *view) {
-    if ([view isKindOfClass:[UIScrollView class]]) {
-        UIScrollView *sv = (UIScrollView *)view;
-        if (sv.scrollEnabled) { sv.scrollEnabled = NO; }
-    }
-    for (UIView *sub in view.subviews) { KGDisableScrolling(sub); }
-}
-
-static IMP KGHomeOrigAppear = NULL;
-static void KGHomeDidAppear(id self, SEL _cmd, BOOL animated) {
-    if (KGHomeOrigAppear) {
-        ((void (*)(id, SEL, BOOL))KGHomeOrigAppear)(self, _cmd, animated);
-    } else {
-        /* class_addMethod 新加的场景：本类无实现，兜底调父类 */
-        Method superM = class_getInstanceMethod(class_getSuperclass(object_getClass(self)), _cmd);
-        if (superM) { ((void (*)(id, SEL, BOOL))method_getImplementation(superM))(self, _cmd, animated); }
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        KGDisableScrolling((UIView *)self);
-    });
-}
-
-static void KGInstallHomeFixedHook(void) {
-    static BOOL installed = NO;
-    if (installed) { return; }
-    Class cls = objc_getClass("KGYouthHomeController");
-    if (!cls) { return; }
-    SEL sel = @selector(viewDidAppear:);
-    if (class_addMethod(cls, sel, (IMP)KGHomeDidAppear, "v@:c")) {
-        installed = YES;
-        KGLogAlways(@"home fixed hook added");
-        return;
-    }
-    /* 本类已有实现：存原 IMP 后替换，绝不丢原逻辑 */
-    unsigned int count = 0;
-    Method *list = class_copyMethodList(cls, &count);
-    for (unsigned int i = 0; i < count; i++) {
-        if (sel_isEqual(method_getName(list[i]), sel)) {
-            KGHomeOrigAppear = method_getImplementation(list[i]);
-            method_setImplementation(list[i], (IMP)KGHomeDidAppear);
-            installed = YES;
-            KGLogAlways(@"home fixed hook replaced");
-            break;
-        }
-    }
-    free(list);
-}
-
-/* ============ v9h: 视图树定期扫描（换实现方式，不靠方法 hook） ============
- * 「赚钱」入口不走 willDisplay、方法 hook 也不命中，彻底换思路：
- * 定时扫描可见 window 的整棵视图树，发现文字命中关键词的 UILabel，
- * 就把它的入口容器（向上第一个有实际尺寸的祖先）整体隐藏。
- * 不依赖类名和 hook 命中，所见即所得；已隐藏子树自动剪枝。 */
-static void KGScanAndHideEntryViews(UIView *view, NSInteger depth) {
-    if (!view || view.hidden || view.alpha <= 0.01 || depth > 24) { return; }
-    if ([view isKindOfClass:[UILabel class]]) {
-        UILabel *label = (UILabel *)view;
-        if (KGTextMatches(label.text) || KGTextMatches(label.attributedText.string)) {
-            /* 向上找最多 3 层，第一个有实际尺寸（>40x20）的祖先即入口容器 */
-            UIView *target = label;
-            UIView *parent = label.superview;
-            for (int i = 0; parent && i < 3; i++) {
-                CGSize s = parent.frame.size;
-                if (s.width > 40 && s.height > 20) { target = parent; break; }
-                parent = parent.superview;
-            }
-            KGHideView(target);
-            KGLogAlways(@"entry scan hidden: %@ in %@", NSStringFromClass([target class]),
-                        NSStringFromClass([KGViewControllerForView(target) class] ?: [NSObject class]));
-            return;
-        }
-    }
-    for (UIView *sub in view.subviews) { KGScanAndHideEntryViews(sub, depth + 1); }
-}
-
-static void KGScanAllWindows(void) {
-    KGInitRuntimeState();
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (!w.hidden) { KGScanAndHideEntryViews(w, 0); }
-    }
-}
-
-static NSTimer *KGEntryScanTimer = nil;
-static NSInteger KGEntryScanTicks = 0;
-static void KGStartEntryScanTimer(void) {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        KGEntryScanTimer = [NSTimer scheduledTimerWithTimeInterval:1.5
-                                                            repeats:YES
-                                                              block:^(NSTimer *timer) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                KGScanAllWindows();
-            });
-            if (++KGEntryScanTicks >= 240) {   /* 1.5s × 240 = 6 分钟 */
-                [timer invalidate];
-                KGEntryScanTimer = nil;
-            }
-        }];
-        if (KGEntryScanTimer) {
-            [[NSRunLoop mainRunLoop] addTimer:KGEntryScanTimer forMode:NSRunLoopCommonModes];
-        }
-    });
-}
-
 static void KGCallCB(id cb) {
     if (cb) { ((KGSuccessCB)cb)(nil); }
 }
@@ -400,7 +266,6 @@ static void KGWillDisplayCollectionCell(id self, SEL _cmd, UICollectionView *col
                                         UICollectionViewCell *cell, NSIndexPath *indexPath) {
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, collectionView, cell, indexPath); }
-    if (!KGContainerAllowsHiding(collectionView)) { return; }
     if (!KGViewTextMatches(cell, 0)) { return; }
 
     KGHideView(cell);
@@ -418,7 +283,6 @@ static void KGWillDisplayTableCell(id self, SEL _cmd, UITableView *tableView,
                                    UITableViewCell *cell, NSIndexPath *indexPath) {
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, tableView, cell, indexPath); }
-    if (!KGContainerAllowsHiding(tableView)) { return; }
     if (!KGViewTextMatches(cell, 0)) { return; }
 
     KGHideView(cell);
@@ -436,7 +300,6 @@ static void KGWillDisplaySupplementary(id self, SEL _cmd, UICollectionView *coll
                                        UIView *view, NSString *kind, NSIndexPath *indexPath) {
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, id, id))original)(self, _cmd, collectionView, view, kind, indexPath); }
-    if (!KGContainerAllowsHiding(collectionView)) { return; }
     if (KGViewTextMatches(view, 0)) { KGHideView(view); }
 }
 
@@ -444,7 +307,6 @@ static void KGWillDisplayTableHeader(id self, SEL _cmd, UITableView *tableView,
                                      UIView *view, NSInteger section) {
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, NSInteger))original)(self, _cmd, tableView, view, section); }
-    if (!KGContainerAllowsHiding(tableView)) { return; }
     if (KGViewTextMatches(view, 0)) { KGHideView(view); }
 }
 
@@ -679,15 +541,17 @@ static KGSelHook kSelHooks[] = {
     {"goToTaskCenterWithSourceId:actionType:taskId:giftId:animated:", (IMP)KGNoopNil},
     {"refreshBottomTaskCenterView:", (IMP)KGNoopNil},
     {"setBottomTaskCenterView:", (IMP)KGNoop},
-    /* v9h: 退路恢复——置空 earnMoneyUrlStr，入口万一漏网，点进去也是拼命加载中 */
-    {"earnMoneyUrlStr", (IMP)KGNoopNil},
-    /* v9f: 任务入口 view 的真实显示/点击（方法 hook 对入口不一定命中，
-     * v9g 起由视图树扫描兜底做视觉隐藏） */
+    /* v9d: 不再置空 earnMoneyUrlStr —— 会让赚钱页 URL=nil 一直转圈。
+     * v9f: 赚钱入口不走 willDisplay 路径，改拦任务入口 view 的
+     * 真实显示/点击方法（showTaskView / clickTaskView 等），
+     * 入口根本不显示，自然点不进去。 */
     {"showTaskView", (IMP)KGNoopNil},
     {"clickTaskView", (IMP)KGNoopNil},
     {"checkShowTaskView", (IMP)KGNoopNil},
     {"checkTaskViewShowBI", (IMP)KGNoopNil},
     {"setTaskView:", (IMP)KGNoop},
+    /* v9c 行为：赚钱页 URL=nil，一直转圈 */
+    {"earnMoneyUrlStr", (IMP)KGNoopNil},
 };
 static const NSUInteger kSelHookCount = sizeof(kSelHooks) / sizeof(kSelHooks[0]);
 
@@ -704,9 +568,6 @@ static KGSelHook kPreserveSelHooks[] = {
 };
 static const NSUInteger kPreserveSelHookCount = sizeof(kPreserveSelHooks) / sizeof(kPreserveSelHooks[0]);
 
-/* v9g: 已检查类缓存（KGInstallSelHookList 跳过已检查过的类） */
-static NSMutableSet *KGCheckedClasses = nil;
-
 static NSUInteger KGInstallSelHookList(KGSelHook *list, NSUInteger listCount, NSMutableSet *hookedMethods) {
     unsigned int classCount = 0;
     Class *classes = objc_copyClassList(&classCount);
@@ -714,12 +575,6 @@ static NSUInteger KGInstallSelHookList(KGSelHook *list, NSUInteger listCount, NS
     __block NSUInteger added = 0;
     for (unsigned int i = 0; i < classCount; i++) {
         Class cls = classes[i];
-        /* v9g: 已检查过的类直接跳过 —— 重试遍历只处理新注册类，
-         * 成本从几秒降到几毫秒，让长周期重试可行（赚钱入口类是
-         * 用户首次进「我的」页才懒加载注册的）。 */
-        NSValue *clsKey = [NSValue valueWithPointer:(void *)cls];
-        if ([KGCheckedClasses containsObject:clsKey]) { continue; }
-        [KGCheckedClasses addObject:clsKey];
         for (NSUInteger j = 0; j < listCount; j++) {
             SEL sel = sel_registerName(list[j].sel);
             Method m = class_getInstanceMethod(cls, sel);
@@ -739,7 +594,6 @@ static NSUInteger KGInstallSelHookList(KGSelHook *list, NSUInteger listCount, NS
 
 static NSUInteger KGInstallSelectorHooksSlow(void) {
     KGInitRuntimeState();
-    if (!KGCheckedClasses) { KGCheckedClasses = [NSMutableSet set]; }
     static NSMutableSet *hookedMethods = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{ hookedMethods = [NSMutableSet set]; });
@@ -782,46 +636,17 @@ static void KGInstallAllHooks(void) {
  * 只在 DidBecomeActive 之后 / 秒级延迟时机异步执行，成功一次即停。 */
 static NSUInteger KGInstallSelectorHooksSlow(void);
 
-/* v9g: 慢批次从「3 次即停」改为长周期重试——赚钱入口类是懒加载注册，
- * 15 秒内根本没出现。有类缓存后每次重试只扫新类，2 秒一次可持续跑。 */
 static BOOL KGSlowHooksDone = NO;
-static NSInteger KGSlowIdleTicks = 0;
 static void KGInstallSlowHooks(void) {
     if (KGSlowHooksDone) { return; }
     NSUInteger added = KGInstallSelectorHooksSlow();
     if (added == 0) {
-        KGSlowIdleTicks++;
-        /* 连续 20 次无新增（约 40 秒无新类）才停 */
-        if (KGSlowIdleTicks >= 20) {
-            KGSlowHooksDone = YES;
-            KGLogAlways(@"slow hooks all installed");
-        }
+        /* 没有新增 = 所有目标 selector 都已挂上，停止重试 */
+        KGSlowHooksDone = YES;
+        KGLogAlways(@"slow hooks all installed");
     } else {
-        KGSlowIdleTicks = 0;
-        KGLogAlways(@"slow hooks +%lu new", (unsigned long)added);
+        KGLogAlways(@"slow hooks +%lu new, will retry", (unsigned long)added);
     }
-}
-
-static NSTimer *KGSlowHookTimer = nil;
-static NSInteger KGSlowHookTicks = 0;
-static void KGStartSlowHookTimer(void) {
-    KGInstallSlowHooks();
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        KGSlowHookTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
-                                                           repeats:YES
-                                                             block:^(NSTimer *timer) {
-            KGInstallSlowHooks();
-            KGInstallHomeFixedHook();   /* 首页类可能晚期注册，顺带重试 */
-            if (++KGSlowHookTicks >= 150 || KGSlowHooksDone) {
-                [timer invalidate];
-                KGSlowHookTimer = nil;
-            }
-        }];
-        if (KGSlowHookTimer) {
-            [[NSRunLoop mainRunLoop] addTimer:KGSlowHookTimer forMode:NSRunLoopCommonModes];
-        }
-    });
 }
 
 %ctor {
@@ -830,13 +655,10 @@ static void KGStartSlowHookTimer(void) {
     /* 1. 立刻挂一次（类已在内存时直接生效）——只跑快批次 */
     KGInstallAllHooks();
 
-    /* 2. 主线程下一个 loop 再挂（覆盖 guest App 刚 dlopen 的情况），并启动各重试定时器 */
+    /* 2. 主线程下一个 loop 再挂（覆盖 guest App 刚 dlopen 的情况），并启动 cell hook 重试定时器 */
     dispatch_async(dispatch_get_main_queue(), ^{
         KGInstallAllHooks();
         KGStartCardHookTimer();
-        KGStartSlowHookTimer();
-        KGInstallHomeFixedHook();
-        KGStartEntryScanTimer();
     });
 
     /* 3. App 启动完成时再挂一次——仍然只跑快批次 */
