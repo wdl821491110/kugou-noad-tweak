@@ -10,7 +10,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 
-#define KG_VER   @"v13"
+#define KG_VER   @"v14"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"
@@ -45,6 +45,11 @@ static NSString *KGAppAppid = nil, *KGAppClientver = nil, *KGAppSalt = nil;
 static NSString *KGNetObsReport = @"";
 static BOOL H_SignA = NO, H_SignB = NO, H_DaoKey = NO, H_DaoInfo = NO;
 static IMP KGOrigSignA = NULL, KGOrigSignB = NULL, KGOrigDaoKey = NULL, KGOrigDaoInfo = NULL;
+// v14：最底层观测点。任何网络请求构造时都会走 -[NSURLRequest URL] / setHTTPBody:，
+// 不依赖任何酷狗私有类，命中率最高。拿到带 token 的 URL 后立即入库并触发领取。
+static IMP KGOrigReqURL = NULL, KGOrigSetBody = NULL;
+static BOOL H_ReqURL = NO, H_SetBody = NO;
+static BOOL KGObservedToken = NO;
 // v13：钥匙串 / Cookie 里的真实凭据
 static NSMutableArray *KGKeyCands = nil;
 static NSMutableString *KGKeyReport = nil;
@@ -278,6 +283,8 @@ static void KGWriteDiag(NSString *extra) {
         H_Login?@"OK":@"MISS", H_EnvInit?@"OK":@"MISS", H_EnvTok?@"OK":@"MISS",
         H_AF?@"OK":@"MISS", H_Common?@"OK":@"MISS", H_Res?@"OK":@"MISS",
         H_SignA?@"OK":@"MISS", H_SignB?@"OK":@"MISS", H_DaoKey?@"OK":@"MISS", H_DaoInfo?@"OK":@"MISS"];
+    [s appendFormat:@"hooks14: requrl=%@ setbody=%@ observed=%@ urls=%d\n",
+        H_ReqURL?@"OK":@"MISS", H_SetBody?@"OK":@"MISS", KGObservedToken?@"YES":@"NO", KGObsUrlCount];
     NSString *token = nil, *uid = nil;
     @synchronized (KGCreds) { token = KGCreds[@"token"]; uid = KGCreds[@"userid"]; }
     [s appendFormat:@"creds: tokLen=%lu uid=%@\n", (unsigned long)(token ? token.length : 0), uid.length ? uid : @"-"];
@@ -1094,6 +1101,30 @@ static void KGInstallCommonHook(Class cc, NSString *selName, int slot) {
     KGOrigCommon2[slot] = method_setImplementation(m, ni);
 }
 
+// v14 核心：全 App 网络请求必经点观测。只要 App 发出任意一个带 token 的请求，
+// 就能拿到「App 真正在用的 token/userid」，这是 v13 之前一直没打通的环节。
+static void KGOnURLSeen(NSString *url) {
+    if (url.length < 8) { return; }
+    if (![url containsString:@"token="]) { return; }
+    KGObserveURL(url, nil);
+    if (KGObservedToken) { return; }
+    NSString *t = nil, *u = nil;
+    @synchronized (KGCreds) {
+        if (KGCreds) {
+            t = KGCreds[@"token"];
+            u = KGCreds[@"userid"];
+        }
+    }
+    if (t.length >= 32 && u.length > 0 && KGAppToken.length >= 32) {
+        KGObservedToken = YES;
+        KGSaveCreds(KGAppToken, KGAppUid.length > 0 ? KGAppUid : u);
+        KGWriteDiag([NSString stringWithFormat:@"v14 命中真实token len=%lu uid=%@ mid=%@ dfid=%@ appid=%@",
+                     (unsigned long)KGAppToken.length, KGAppUid, KGAppMid, KGAppDfid, KGAppAppid]);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ KGDoClaim(); });
+    }
+}
+
 static void KGInstallHooksOnce(void) {
     // 1) KGSVUserInfoManager setLoginInfoWithKugouID:token:nikeName:
     if (!H_Login) {
@@ -1311,6 +1342,48 @@ static void KGInstallHooksOnce(void) {
             });
             KGOrigDaoInfo = method_setImplementation(m, ni);
             H_DaoInfo = (KGOrigDaoInfo != NULL);
+        }
+    }
+    // 8) -[NSURLRequest URL] —— v14 的关键。全 App 任何网络请求构造/发送都会访问 URL，
+    //    不依赖酷狗任何私有类，是唯一一定能命中的观测点。
+    if (!H_ReqURL) {
+        Class c = objc_getClass("NSURLRequest");
+        SEL s = sel_registerName("URL");
+        Method m = c ? class_getInstanceMethod(c, s) : NULL;
+        if (m) {
+            IMP ni = imp_implementationWithBlock(^id(id self) {
+                id r = KGOrigReqURL ? ((id(*)(id, SEL))KGOrigReqURL)(self, s) : nil;
+                @try {
+                    if ([r isKindOfClass:NSURL.class]) {
+                        static int budget = 0;
+                        if (budget < 6000) { budget++; KGOnURLSeen([(NSURL *)r absoluteString]); }
+                    }
+                } @catch (__unused NSException *ex) {}
+                return r;
+            });
+            KGOrigReqURL = method_setImplementation(m, ni);
+            H_ReqURL = (KGOrigReqURL != NULL);
+        }
+    }
+    // 9) -[NSMutableURLRequest setHTTPBody:] —— POST 时参数在 body 里，从这捞
+    if (!H_SetBody) {
+        Class c = objc_getClass("NSMutableURLRequest");
+        SEL s = sel_registerName("setHTTPBody:");
+        Method m = c ? class_getInstanceMethod(c, s) : NULL;
+        if (m) {
+            IMP ni = imp_implementationWithBlock(^(id self, NSData *body) {
+                if (KGOrigSetBody) { ((void(*)(id, SEL, id))KGOrigSetBody)(self, s, body); }
+                @try {
+                    if (body.length > 8 && body.length < 30000) {
+                        NSString *str = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+                        if (str.length && [str containsString:@"token="]) {
+                            KGOnURLSeen([@"?" stringByAppendingString:str]);
+                        }
+                    }
+                } @catch (__unused NSException *ex) {}
+            });
+            KGOrigSetBody = method_setImplementation(m, ni);
+            H_SetBody = (KGOrigSetBody != NULL);
         }
     }
 }
