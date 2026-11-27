@@ -1,12 +1,12 @@
-/* kgvipaward v3 自动领版 — 酷狗概念版打开自动领会员
+/* kgvipaward v4 自动领版 — 酷狗概念版打开自动领会员
  *
- * A. 凭据采集（v3 改为主攻 App 请求层）：
- *   - swizzle KGNetworkTools urlPublicParameterDictionary: （App 所有请求的公共参数
- *     字典：dfid/mid/token/userid 全在里面，swizzle 类方法对所有实例生效）
- *   - swizzle KGNetworkTools signFillUrlCustomParameterDictionary:bodyString:isCdnRequest:signature:
- *     （补抓单请求自定义参数）
- *   - NSURLSession dataTaskWithRequest:completionHandler: 兜底（v2 遗留）
- *   凭据齐了（token+userid）弹一次「凭据已采集」，随后自动领取。
+ * A. 凭据获取（v4 改为主动读 + hook 兜底，不再赌请求路径）：
+ *   - 主动：KGSVUserInfoManager.shareInstance 的 token / kugouId 属性直接读
+ *   - hook：KGCommonParamDao generateCommonDict / generateNewCommonDict
+ *     （App 每个请求的公共参数字典生成点，dfid/mid/token/userid 全在内）
+ *   - hook：KGNetworkTools urlPublicParameterDictionary:（v3 遗留）
+ *   - hook：NSURLSession dataTaskWithRequest:completionHandler:（兜底）
+ *   凭据齐了弹「凭据已采集」，随后自动领取。
  * B. 自动领取（复刻 DL Music 验证过的服务端接口）：
  *   1) 签到 POST /youth/v1/recharge/receive_vip_listen_song
  *      (source_id=90139, receive_day=今天) → 领 1 天畅听 VIP
@@ -24,7 +24,7 @@
 
 #define KG_SALT @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
-#define KG_VER @"v3"
+#define KG_VER @"v4"
 
 static NSMutableDictionary *KGCreds = nil;
 static BOOL KGCredsLoaded = NO;
@@ -32,9 +32,10 @@ static BOOL KGClaimDone = NO;
 static BOOL KGReadyAlertShown = NO;
 static IMP KGOrigDataTask = NULL;
 static IMP KGOrigPublicDict = NULL;
-static IMP KGOrigSignFill = NULL;
+static IMP KGOrigCommonDict1 = NULL;
+static IMP KGOrigCommonDict2 = NULL;
 
-static void KGAutoClaim(void);   /* 前置声明：采集层会触发自动领 */
+static void KGAutoClaim(void);   /* 前置声明 */
 
 /* ================= 弹窗 ================= */
 static void KGVipAlert(NSString *msg) {
@@ -106,7 +107,7 @@ static void KGCaptureKV(NSString *k, NSString *v) {
     BOOL hit = NO;
     @synchronized (KGCreds) {
         if ([k isEqualToString:@"token"]) { KGCreds[@"token"] = v; hit = YES; }
-        else if ([k isEqualToString:@"userid"] || [k isEqualToString:@"kugouid"]) {
+        else if ([k isEqualToString:@"userid"] || [k isEqualToString:@"kugouid"] || [k isEqualToString:@"kugouId"]) {
             if (![v isEqualToString:@"0"]) { KGCreds[@"userid"] = v; hit = YES; }
         }
         else if ([k isEqualToString:@"dfid"]) { KGCreds[@"dfid"] = v; hit = YES; }
@@ -117,7 +118,12 @@ static void KGCaptureKV(NSString *k, NSString *v) {
 
 static void KGCaptureDict(NSDictionary *dict) {
     if (![dict isKindOfClass:[NSDictionary class]]) { return; }
-    for (NSString *k in dict) { KGCaptureKV(k, [NSString stringWithFormat:@"%@", dict[k]]); }
+    for (NSString *k in dict.allKeys) {
+        id v = dict[k];
+        if ([v isKindOfClass:[NSString class]] || [v isKindOfClass:[NSNumber class]]) {
+            KGCaptureKV(k, [NSString stringWithFormat:@"%@", v]);
+        }
+    }
     if (!KGReadyAlertShown && KGCredsReady()) {
         KGReadyAlertShown = YES;
         KGVipAlert(@"凭据已采集，稍后自动领取");
@@ -126,32 +132,58 @@ static void KGCaptureDict(NSDictionary *dict) {
     }
 }
 
-static void KGCaptureURL(NSURL *url) {
-    NSString *host = url.host.lowercaseString;
-    if (!host || ![host containsString:@"kugou"]) { return; }
-    NSURLComponents *c = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
-    for (NSURLQueryItem *it in c.queryItems) { KGCaptureKV(it.name, it.value); }
+/* ================= 主动读：登录管理器 ================= */
+static void KGReadLoginManager(void) {
+    Class sv = objc_getClass("KGSVUserInfoManager");
+    if (!sv) { return; }
+    Method m = class_getClassMethod(sv, sel_registerName("shareInstance"));
+    if (!m) { return; }
+    id inst = ((id (*)(id, SEL))method_getImplementation(m))(sv, sel_registerName("shareInstance"));
+    if (!inst) { return; }
+
+    Method mt = class_getInstanceMethod(sv, sel_registerName("token"));
+    if (mt) {
+        NSString *t = ((NSString *(*)(id, SEL))method_getImplementation(mt))(inst, sel_registerName("token"));
+        if ([t isKindOfClass:[NSString class]] && t.length > 0) { KGCaptureKV(@"token", t); }
+    }
+    Method mk = class_getInstanceMethod(sv, sel_registerName("kugouId"));
+    if (mk) {
+        id k = ((id (*)(id, SEL))method_getImplementation(mk))(inst, sel_registerName("kugouId"));
+        NSString *ks = [NSString stringWithFormat:@"%@", k];
+        if (![ks isEqualToString:@"0"] && ![ks isEqualToString:@"<nil>"] && ![ks isEqualToString:@"(null)"]) {
+            KGCaptureKV(@"kugouid", ks);
+        }
+    }
 }
 
-/* ================= swizzle 1：KGNetworkTools 公共参数字典（主通道） ================= */
+/* ================= hooks（采集兜底） ================= */
 static id KGPublicDictImp(id self, SEL _cmd, BOOL flag) {
     id dict = ((id (*)(id, SEL, BOOL))KGOrigPublicDict)(self, _cmd, flag);
     KGCaptureDict(dict);
     return dict;
 }
 
-/* ================= swizzle 2：signFillUrl（补抓自定义参数） ================= */
-static id KGSignFillImp(id self, SEL _cmd, id paramDict, id bodyString, BOOL isCdn, id *signature) {
-    KGCaptureDict(paramDict);
-    return ((id (*)(id, SEL, id, id, BOOL, id *))KGOrigSignFill)(self, _cmd, paramDict, bodyString, isCdn, signature);
+static id KGCommonDictImp(id self, SEL _cmd) {
+    id dict = ((id (*)(id, SEL))KGOrigCommonDict1)(self, _cmd);
+    KGCaptureDict(dict);
+    return dict;
 }
 
-/* ================= swizzle 3：NSURLSession 兜底 ================= */
+static id KGCommonDictNewImp(id self, SEL _cmd) {
+    id dict = ((id (*)(id, SEL))KGOrigCommonDict2)(self, _cmd);
+    KGCaptureDict(dict);
+    return dict;
+}
+
 static id KGDataTaskImp(id self, SEL _cmd, NSURLRequest *request, id handler) {
-    KGCaptureURL(request.URL);
-    NSDictionary *headers = request.allHTTPHeaderFields;
-    if (headers) {
-        for (NSString *k in headers) { KGCaptureKV(k.lowercaseString, headers[k]); }
+    NSString *host = request.URL.host.lowercaseString;
+    if (host && [host containsString:@"kugou"]) {
+        NSURLComponents *c = [NSURLComponents componentsWithURL:request.URL resolvingAgainstBaseURL:NO];
+        for (NSURLQueryItem *it in c.queryItems) { KGCaptureKV(it.name, it.value); }
+        NSDictionary *headers = request.allHTTPHeaderFields;
+        if (headers) {
+            for (NSString *k in headers) { KGCaptureKV(k.lowercaseString, headers[k]); }
+        }
     }
     if (KGOrigDataTask) {
         return ((id (*)(id, SEL, NSURLRequest *, id))KGOrigDataTask)(self, _cmd, request, handler);
@@ -160,33 +192,30 @@ static id KGDataTaskImp(id self, SEL _cmd, NSURLRequest *request, id handler) {
 }
 
 static void KGVipInstallCapture(void) {
-    /* KGNetworkTools：App 网络层主通道 */
-    Class kg = objc_getClass("KGNetworkTools");
-    if (kg) {
-        if (!KGOrigPublicDict) {
+    if (!KGOrigPublicDict) {
+        Class kg = objc_getClass("KGNetworkTools");
+        if (kg) {
             Method m = class_getInstanceMethod(kg, sel_registerName("urlPublicParameterDictionary:"));
-            if (m) {
-                KGOrigPublicDict = method_getImplementation(m);
-                method_setImplementation(m, (IMP)KGPublicDictImp);
-            }
-        }
-        if (!KGOrigSignFill) {
-            Method m2 = class_getInstanceMethod(kg, sel_registerName("signFillUrlCustomParameterDictionary:bodyString:isCdnRequest:signature:"));
-            if (m2) {
-                KGOrigSignFill = method_getImplementation(m2);
-                method_setImplementation(m2, (IMP)KGSignFillImp);
-            }
+            if (m) { KGOrigPublicDict = method_getImplementation(m); method_setImplementation(m, (IMP)KGPublicDictImp); }
         }
     }
-    /* NSURLSession 兜底 */
+    /* KGCommonParamDao：公共参数字典生成点（v4 主 hook） */
+    Class cp = objc_getClass("KGCommonParamDao");
+    if (cp) {
+        if (!KGOrigCommonDict1) {
+            Method m = class_getInstanceMethod(cp, sel_registerName("generateCommonDict"));
+            if (m) { KGOrigCommonDict1 = method_getImplementation(m); method_setImplementation(m, (IMP)KGCommonDictImp); }
+        }
+        if (!KGOrigCommonDict2) {
+            Method m = class_getInstanceMethod(cp, sel_registerName("generateNewCommonDict"));
+            if (m) { KGOrigCommonDict2 = method_getImplementation(m); method_setImplementation(m, (IMP)KGCommonDictNewImp); }
+        }
+    }
     if (!KGOrigDataTask) {
         Class cls = [NSURLSession class];
         SEL sel = @selector(dataTaskWithRequest:completionHandler:);
         Method m = class_getInstanceMethod(cls, sel);
-        if (m) {
-            KGOrigDataTask = method_getImplementation(m);
-            method_setImplementation(m, (IMP)KGDataTaskImp);
-        }
+        if (m) { KGOrigDataTask = method_getImplementation(m); method_setImplementation(m, (IMP)KGDataTaskImp); }
     }
 }
 
@@ -306,6 +335,7 @@ static void KGDoSignIn(void) {
 static void KGAutoClaim(void) {
     if (KGClaimDone) { return; }
     KGLoadCreds();
+    KGReadLoginManager();      /* 主动读登录管理器（v4） */
     if (!KGCredsReady()) { return; }
     KGClaimDone = YES;
     KGDoSignIn();
@@ -356,21 +386,29 @@ static void KGVipInstallEntryHooks(void) {
         KGVipInstallEntryHooks();
     });
 
-    /* 启动确认弹窗（调试版，带版本号防装错文件） */
+    /* 启动确认弹窗（带版本号防装错文件） */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         KGVipAlert([NSString stringWithFormat:@"已加载（%@）", KG_VER]);
     });
 
-    /* 40 秒诊断：凭据还没到位就明说 */
+    /* 40 秒诊断：具体缺哪个字段 */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(40.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (!KGClaimDone && !KGCredsReady()) {
-            KGVipAlert([NSString stringWithFormat:@"%@诊断：40秒了凭据还没采到（KGNetworkTools 未命中）", KG_VER]);
+        if (KGClaimDone) { return; }
+        KGLoadCreds();
+        KGReadLoginManager();
+        if (KGCredsReady()) { KGAutoClaim(); return; }
+        @synchronized (KGCreds) {
+            NSMutableArray *miss = [NSMutableArray array];
+            if (KGCreds[@"token"].length == 0) { [miss addObject:@"token"]; }
+            if (KGCreds[@"userid"].length == 0) { [miss addObject:@"userid"]; }
+            KGVipAlert([NSString stringWithFormat:@"%@诊断：缺 [%@]，登录管理器也没读到", KG_VER,
+                        miss.count ? [miss componentsJoinedByString:@","] : @"无"]);
         }
     });
 
-    /* 自动领：多次尝试兜底（凭据采集到位才执行） */
+    /* 自动领：多次尝试兜底 */
     NSArray *delays = @[@25.0, @45.0, @90.0, @180.0, @300.0];
     for (NSNumber *d in delays) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
