@@ -32,18 +32,6 @@
  *  - v9b：v9 启动黑屏后闪退，判定是 sizeForItem / heightForRow /
  *     preferredLayoutAttributesFittingAttributes 归零导致布局反复重算。
  *     v9b 回退全部高度归零，只保留按文字隐藏 + 真实点击拦截，先保启动稳定。
- *  - v9f：恢复高度归零 + 新增隐藏关键词 + 任务入口 show/click 拦截。
- *  - v9i：恢复首页「免费听」卡片（删掉该隐藏关键词）；
- *     恢复 v9c 的 earnMoneyUrlStr 置空（赚钱页一直转圈）。
- *  - v10A：设置页精简。
- *     * 新增「设置页作用域」判定：仅当承载 tableView/collectionView 的
- *       最近 ViewController 类名含 Setting/Config/Preference/Personal/Privacy
- *       时，才启用设置页专用隐藏词表，避免污染全局。
- *     * KGHideAdKeywords：广告/隐私类条目，任意页面命中即隐藏
- *       （定向广告推送、个性化广告等）。
- *     * KGHideSettingsKeywords：设置页专用条目，逐条可增删。
- *     * 设置页条目自检日志：进入设置页时逐条打印 cell 文本
- *       （前缀 [KGSettings]），便于拿到真实条目清单再逐条精确隐藏。
  */
 
 @import Foundation;
@@ -68,10 +56,6 @@ typedef void (^KGSuccessCB)(id);
 static NSMutableDictionary *KGOriginalIMPs = nil;
 static NSArray *KGHideKeywords = nil;
 static NSMutableSet *KGHiddenPaths = nil;
-/* v10A: 广告/隐私类条目（任意页面命中即隐藏） */
-static NSArray *KGHideAdKeywords = nil;
-/* v10A: 设置页专用条目（仅设置页作用域生效），逐条可增删 */
-static NSArray *KGHideSettingsKeywords = nil;
 
 static void KGInitRuntimeState(void) {
     static dispatch_once_t onceToken;
@@ -83,14 +67,6 @@ static void KGInitRuntimeState(void) {
             @"概念er新推", @"概念实验室", @"曲风盲盒", @"VIP专属", @"小众宝藏",
             @"赚钱", @"赚金币", @"赚概念币", @"任务中心",
             @"频道推荐", @"潮流尝鲜"
-        ];
-        /* 广告/隐私推送类：出现在哪都该消失 */
-        KGHideAdKeywords = @[
-            @"定向广告推送", @"个性化广告", @"广告推送设置", @"个性化内容展示"
-        ];
-        /* 设置页专用：只在设置页作用域内生效，按需增删 */
-        KGHideSettingsKeywords = @[
-            @"青少年模式", @"未成年人模式"
         ];
     });
 }
@@ -117,124 +93,6 @@ static BOOL KGTextMatches(NSString *text) {
         if ([text rangeOfString:keyword options:(NSCaseInsensitiveSearch | NSLiteralSearch)].location != NSNotFound) {
             return YES;
         }
-    }
-    return NO;
-}
-
-/* v10A: 广告/隐私类关键词，任意作用域命中即隐藏 */
-static BOOL KGTextMatchesAd(NSString *text) {
-    if (text.length == 0) { return NO; }
-    for (NSString *keyword in KGHideAdKeywords) {
-        if ([text rangeOfString:keyword options:(NSCaseInsensitiveSearch | NSLiteralSearch)].location != NSNotFound) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-/* v10A: 设置页专用关键词，仅设置页作用域内生效 */
-static BOOL KGTextMatchesSettings(NSString *text) {
-    if (text.length == 0) { return NO; }
-    for (NSString *keyword in KGHideSettingsKeywords) {
-        if ([text rangeOfString:keyword options:(NSCaseInsensitiveSearch | NSLiteralSearch)].location != NSNotFound) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-/* ============ v10A: 设置页作用域判定 ============
- * 目标：把「设置页专用隐藏词」限制在设置页内生效，不污染全局。
- * 做法：向上找最近的 UIViewController，看类名是否含 Setting/Config/
- * Preference/Personal/Privacy 等特征；找不到就退回按容器自身类名判断。 */
-static BOOL KGClassNameLooksLikeSettings(NSString *className) {
-    if (className.length == 0) { return NO; }
-    static NSArray *marks = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        marks = @[@"Setting", @"Config", @"Preference", @"Personal", @"Privacy", @"UserCenter"];
-    });
-    for (NSString *mark in marks) {
-        if ([className rangeOfString:mark options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-static UIViewController *KGNearestViewController(UIView *view) {
-    UIResponder *responder = view.nextResponder;
-    NSInteger guard = 0;
-    while (responder && guard++ < 12) {
-        if ([responder isKindOfClass:[UIViewController class]]) {
-            return (UIViewController *)responder;
-        }
-        responder = responder.nextResponder;
-    }
-    return nil;
-}
-
-/* v10A: 作用域判定结果按容器缓存。
- * willDisplayCell 在滚动时高频触发，若每次都遍历 responder chain
- * 会造成明显卡顿（与 v9h 被否的高频全树扫描同类问题）。
- * 用关联对象把结果挂在容器上：容器释放时关联对象自动清理，不会泄漏。
- * 缓存 key 用容器指针 + 4 个不同标志位区分，避免同一容器被误用。 */
-static const void *KGScopeCacheKey = &KGScopeCacheKey;
-
-static BOOL KGIsSettingsScope(UIView *container) {
-    if (!container) { return NO; }
-
-    NSNumber *cached = objc_getAssociatedObject(container, KGScopeCacheKey);
-    if (cached) { return [cached boolValue]; }
-
-    BOOL result = NO;
-    UIViewController *vc = KGNearestViewController(container);
-    if (vc && KGClassNameLooksLikeSettings(NSStringFromClass([vc class]))) {
-        result = YES;
-    }
-    /* 退路：容器自身类名带设置特征（部分页面用自定义容器） */
-    if (!result && KGClassNameLooksLikeSettings(NSStringFromClass([container class]))) {
-        result = YES;
-    }
-
-    objc_setAssociatedObject(container, KGScopeCacheKey, @(result), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return result;
-}
-
-/* v10A: 收集 cell 内所有可见文字（用于条目自检日志） */
-static void KGCollectTexts(UIView *view, NSInteger depth, NSMutableArray *out) {
-    if (!view || depth > 12) { return; }
-    if ([view isKindOfClass:[UILabel class]]) {
-        UILabel *label = (UILabel *)view;
-        NSString *t = label.text.length ? label.text : label.attributedText.string;
-        if (t.length) { [out addObject:t]; }
-    } else if ([view isKindOfClass:[UIButton class]]) {
-        UIButton *button = (UIButton *)view;
-        NSString *t = button.titleLabel.text;
-        if (t.length) { [out addObject:t]; }
-    }
-    for (UIView *sub in view.subviews) { KGCollectTexts(sub, depth + 1, out); }
-}
-
-/* v10A: 命中判定（广告词 / 设置页词），找到即返回 YES 早停。
- * 与 KGCollectTexts 分开是为了避免「为了判隐藏而收集全部文本」的开销。 */
-static BOOL KGViewHitsHideRule(UIView *view, NSInteger depth, BOOL isSettings) {
-    if (!view || depth > 12) { return NO; }
-    if ([view isKindOfClass:[UILabel class]]) {
-        UILabel *label = (UILabel *)view;
-        NSString *t = label.text.length ? label.text : label.attributedText.string;
-        if (KGTextMatchesAd(t)) { return YES; }
-        if (isSettings && KGTextMatchesSettings(t)) { return YES; }
-    } else if ([view isKindOfClass:[UIButton class]]) {
-        UIButton *button = (UIButton *)view;
-        NSString *t = button.titleLabel.text;
-        if (KGTextMatchesAd(t)) { return YES; }
-        if (isSettings && KGTextMatchesSettings(t)) { return YES; }
-    }
-    if (KGTextMatchesAd(view.accessibilityLabel)) { return YES; }
-    if (isSettings && KGTextMatchesSettings(view.accessibilityLabel)) { return YES; }
-    for (UIView *sub in view.subviews) {
-        if (KGViewHitsHideRule(sub, depth + 1, isSettings)) { return YES; }
     }
     return NO;
 }
@@ -408,23 +266,7 @@ static void KGWillDisplayCollectionCell(id self, SEL _cmd, UICollectionView *col
                                         UICollectionViewCell *cell, NSIndexPath *indexPath) {
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, collectionView, cell, indexPath); }
-    BOOL isSettings = KGIsSettingsScope(collectionView);
-    BOOL shouldHide = KGViewTextMatches(cell, 0);
-    if (!shouldHide) {
-        /* 广告/隐私类任意作用域生效；设置页专用词仅设置页生效。命中即早停。 */
-        shouldHide = KGViewHitsHideRule(cell, 0, isSettings);
-    }
-    /* v10A: 设置页条目自检日志（打印真实条目，便于逐条精确隐藏） */
-    if (isSettings && !shouldHide) {
-        NSMutableArray *texts = [NSMutableArray array];
-        KGCollectTexts(cell, 0, texts);
-        if (texts.count) {
-            KGLogAlways(@"[KGSettings] collection %ld-%ld : %@",
-                        (long)indexPath.section, (long)indexPath.item,
-                        [texts componentsJoinedByString:@" | "]);
-        }
-    }
-    if (!shouldHide) { return; }
+    if (!KGViewTextMatches(cell, 0)) { return; }
 
     KGHideView(cell);
     BOOL fresh = KGMarkHiddenPath(collectionView, indexPath.section, indexPath.item);
@@ -441,22 +283,7 @@ static void KGWillDisplayTableCell(id self, SEL _cmd, UITableView *tableView,
                                    UITableViewCell *cell, NSIndexPath *indexPath) {
     IMP original = KGCurrentOriginalIMP(self, _cmd);
     if (original) { ((void (*)(id, SEL, id, id, id))original)(self, _cmd, tableView, cell, indexPath); }
-    BOOL isSettings = KGIsSettingsScope(tableView);
-    BOOL shouldHide = KGViewTextMatches(cell, 0);
-    if (!shouldHide) {
-        shouldHide = KGViewHitsHideRule(cell, 0, isSettings);
-    }
-    /* v10A: 设置页条目自检日志 */
-    if (isSettings && !shouldHide) {
-        NSMutableArray *texts = [NSMutableArray array];
-        KGCollectTexts(cell, 0, texts);
-        if (texts.count) {
-            KGLogAlways(@"[KGSettings] table %ld-%ld : %@",
-                        (long)indexPath.section, (long)indexPath.row,
-                        [texts componentsJoinedByString:@" | "]);
-        }
-    }
-    if (!shouldHide) { return; }
+    if (!KGViewTextMatches(cell, 0)) { return; }
 
     KGHideView(cell);
     BOOL fresh = KGMarkHiddenPath(tableView, indexPath.section, indexPath.row);
