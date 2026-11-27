@@ -10,7 +10,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 
-#define KG_VER   @"v14"
+#define KG_VER   @"v15"
 #define KG_SALT  @"LnT6xpN3khm36zse0QzvmgTZ3waWdRSA"
 #define KG_CREDS_KEY @"kg_vipaward_creds"
 #define KG_MID   @"158116268513255000000000000000"
@@ -50,6 +50,10 @@ static IMP KGOrigSignA = NULL, KGOrigSignB = NULL, KGOrigDaoKey = NULL, KGOrigDa
 static IMP KGOrigReqURL = NULL, KGOrigSetBody = NULL;
 static BOOL H_ReqURL = NO, H_SetBody = NO;
 static BOOL KGObservedToken = NO;
+// v15：记录 App 自己发出的 youth 请求原始 URL（含完整 signature），
+// 用来反推 appid=3114 对应的 salt；我们自己的请求靠关联对象打标记排除。
+static NSMutableArray *KGRawReqs = nil;
+static char kKGOurReqKey;
 // v13：钥匙串 / Cookie 里的真实凭据
 static NSMutableArray *KGKeyCands = nil;
 static NSMutableString *KGKeyReport = nil;
@@ -137,7 +141,10 @@ static void KGObserveURL(NSString *url, NSString *saltHint) {
     NSDictionary *p = KGQueryDict(url);
     if (p.count == 0) { return; }
     NSString *t = KGStr(p[@"token"]);
-    if (t.length >= 32) { KGAppToken = t; }
+    // v15：64 位才是登录 token，钥匙串里的 36/40 位是 qimei 之类，不能被顶掉
+    if (t.length >= 32) {
+        if (!KGAppToken || t.length == 64 || t.length > KGAppToken.length) { KGAppToken = t; }
+    }
     NSString *u = KGStr(p[@"userid"]); if (u.length == 0) { u = KGStr(p[@"kugouid"]); }
     if (KGUsable(u)) { KGAppUid = u; }
     NSString *df = KGStr(p[@"dfid"]); if (df.length == 0) { df = KGStr(p[@"dfid2"]); }
@@ -186,7 +193,10 @@ static void KGObserveDict(id dict, NSString *salt, NSString *appid) {
     if (![dict isKindOfClass:NSDictionary.class]) { return; }
     NSDictionary *p = dict;
     NSString *t = KGStr(p[@"token"]);
-    if (t.length >= 32) { KGAppToken = t; }
+    // v15：64 位才是登录 token，钥匙串里的 36/40 位是 qimei 之类，不能被顶掉
+    if (t.length >= 32) {
+        if (!KGAppToken || t.length == 64 || t.length > KGAppToken.length) { KGAppToken = t; }
+    }
     NSString *u = KGStr(p[@"userid"]); if (u.length == 0) { u = KGStr(p[@"kugouid"]); }
     if (KGUsable(u)) { KGAppUid = u; }
     NSString *df = KGStr(p[@"dfid"]);
@@ -205,7 +215,9 @@ static void KGObserveDict(id dict, NSString *salt, NSString *appid) {
 }
 
 static NSString *KGSign(NSDictionary *params) {
-    NSString *salt = KGCurSalt();
+    // v15：签名必须与 appid 同口径。本地实测 appid=3116 + LnT6xpN3… 签名被服务端认可(返回 51002 而非 20006)，
+    // appid=3114/1058 配任何已知 salt 都是 20006。因此固定 3116 口径，绝不再用观测到的 appid 参与签名。
+    NSString *salt = KG_SALT;
     NSMutableString *s = [NSMutableString string];
     for (NSString *k in [params.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
         [s appendFormat:@"%@=%@", k, params[k]];
@@ -285,6 +297,15 @@ static void KGWriteDiag(NSString *extra) {
         H_SignA?@"OK":@"MISS", H_SignB?@"OK":@"MISS", H_DaoKey?@"OK":@"MISS", H_DaoInfo?@"OK":@"MISS"];
     [s appendFormat:@"hooks14: requrl=%@ setbody=%@ observed=%@ urls=%d\n",
         H_ReqURL?@"OK":@"MISS", H_SetBody?@"OK":@"MISS", KGObservedToken?@"YES":@"NO", KGObsUrlCount];
+    // v15：App 自己发出的 youth 请求原始 URL（含 signature），用于反推 appid=3114 的 salt
+    @synchronized (KGRawReqs) {
+        [s appendString:@"rawreq:"];
+        if (!KGRawReqs || KGRawReqs.count == 0) { [s appendString:@" (无)\n"]; }
+        else {
+            [s appendFormat:@" %lu 条\n", (unsigned long)KGRawReqs.count];
+            for (NSString *u in KGRawReqs) { [s appendFormat:@"  %@\n", u]; }
+        }
+    }
     NSString *token = nil, *uid = nil;
     @synchronized (KGCreds) { token = KGCreds[@"token"]; uid = KGCreds[@"userid"]; }
     [s appendFormat:@"creds: tokLen=%lu uid=%@\n", (unsigned long)(token ? token.length : 0), uid.length ? uid : @"-"];
@@ -608,8 +629,8 @@ static void KGPost(NSString *path, NSMutableDictionary *params,
     params[@"dfid"] = KGCurDfid();
     params[@"uuid"] = @"-";
     params[@"mid"] = KGCurMid();
-    params[@"appid"] = KGCurAppid();
-    params[@"clientver"] = KGCurCver();
+    params[@"appid"] = KG_APPID;
+    params[@"clientver"] = KG_CLIENTVER;
     NSString *ct = [NSString stringWithFormat:@"%d", (int)[NSDate date].timeIntervalSince1970];
     params[@"clienttime"] = ct;
     params[@"signature"] = KGSign(params);
@@ -621,6 +642,7 @@ static void KGPost(NSString *path, NSMutableDictionary *params,
     NSString *url = [NSString stringWithFormat:@"https://gateway.kugou.com%@?%@", path, [qs componentsJoinedByString:@"&"]];
 
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
+    objc_setAssociatedObject(req, &kKGOurReqKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     req.HTTPMethod = @"POST";
     [req setValue:KG_UA forHTTPHeaderField:@"User-Agent"];
     [req setValue:KGCurDfid() forHTTPHeaderField:@"dfid"];
@@ -648,8 +670,8 @@ static void KGGet(NSString *path, NSMutableDictionary *params,
     params[@"dfid"] = KGCurDfid();
     params[@"uuid"] = @"-";
     params[@"mid"] = KGCurMid();
-    params[@"appid"] = KGCurAppid();
-    params[@"clientver"] = KGCurCver();
+    params[@"appid"] = KG_APPID;
+    params[@"clientver"] = KG_CLIENTVER;
     NSString *ct = [NSString stringWithFormat:@"%d", (int)[NSDate date].timeIntervalSince1970];
     params[@"clienttime"] = ct;
     params[@"signature"] = KGSign(params);
@@ -660,6 +682,7 @@ static void KGGet(NSString *path, NSMutableDictionary *params,
     }
     NSString *url = [NSString stringWithFormat:@"https://gateway.kugou.com%@?%@", path, [qs componentsJoinedByString:@"&"]];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
+    objc_setAssociatedObject(req, &kKGOurReqKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     req.HTTPMethod = @"GET";
     [req setValue:KG_UA forHTTPHeaderField:@"User-Agent"];
     [req setValue:KGCurDfid() forHTTPHeaderField:@"dfid"];
@@ -746,7 +769,9 @@ static void KGProbeApis(void (^done)(void)) {
     KGGet(@"/youth/v1/account/get_vip_tips", vt, ^(NSDictionary *json, NSError *err) {
         NSString *code = KGRespCode(json);
         NSString *valid = @"?";
-        if (code.length) { valid = [code isEqualToString:@"51002"] ? @"N" : @"Y"; }
+        // v15：只有无错误码 / code=0 才算 token 有效；51002、20006、20002 全是无效
+        if (code.length == 0 || [code isEqualToString:@"0"]) { valid = @"Y"; }
+        else { valid = @"N"; }
         NSString *head = [NSString stringWithFormat:@"tokenValid: %@ (code=%@ %@, salt=%@ appid=%@ dfid=%@)",
                           valid, code.length ? code : @"-", KGRespMsg(json),
                           KGCurSalt(), KGCurAppid(), KGCurDfid()];
@@ -1101,6 +1126,27 @@ static void KGInstallCommonHook(Class cc, NSString *selName, int slot) {
     KGOrigCommon2[slot] = method_setImplementation(m, ni);
 }
 
+// v15：抓 App 自己发出的 youth 请求原始 URL（含完整 signature），用于反推 appid=3114 的 salt。
+// 前提是该请求不是我们自己发的（KGPost/KGGet 会打关联标记）。
+static void KGRawCapture(NSString *url) {
+    if (url.length < 40) { return; }
+    if ([url rangeOfString:@"gateway.kugou.com"].location == NSNotFound) { return; }
+    if ([url rangeOfString:@"signature="].location == NSNotFound) { return; }
+    if ([url rangeOfString:@"youth/"].location == NSNotFound &&
+        [url rangeOfString:@"recharge"].location == NSNotFound &&
+        [url rangeOfString:@"listen_song"].location == NSNotFound) { return; }
+    if (!KGRawReqs) { KGRawReqs = [NSMutableArray array]; }
+    @synchronized (KGRawReqs) {
+        if (KGRawReqs.count >= 8) { return; }
+        // 同一接口只保留第一条（clienttime 每次都变，整串去重无效）
+        NSString *pathOnly = [url componentsSeparatedByString:@"?"].firstObject;
+        for (NSString *e in KGRawReqs) {
+            if ([[e componentsSeparatedByString:@"?"].firstObject isEqualToString:pathOnly]) { return; }
+        }
+        [KGRawReqs addObject:url];
+    }
+}
+
 // v14 核心：全 App 网络请求必经点观测。只要 App 发出任意一个带 token 的请求，
 // 就能拿到「App 真正在用的 token/userid」，这是 v13 之前一直没打通的环节。
 static void KGOnURLSeen(NSString *url) {
@@ -1108,21 +1154,14 @@ static void KGOnURLSeen(NSString *url) {
     if (![url containsString:@"token="]) { return; }
     KGObserveURL(url, nil);
     if (KGObservedToken) { return; }
-    NSString *t = nil, *u = nil;
-    @synchronized (KGCreds) {
-        if (KGCreds) {
-            t = KGCreds[@"token"];
-            u = KGCreds[@"userid"];
-        }
-    }
-    if (t.length >= 32 && u.length > 0 && KGAppToken.length >= 32) {
-        KGObservedToken = YES;
-        KGSaveCreds(KGAppToken, KGAppUid.length > 0 ? KGAppUid : u);
-        KGWriteDiag([NSString stringWithFormat:@"v14 命中真实token len=%lu uid=%@ mid=%@ dfid=%@ appid=%@",
-                     (unsigned long)KGAppToken.length, KGAppUid, KGAppMid, KGAppDfid, KGAppAppid]);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ KGDoClaim(); });
-    }
+    // v15：只有 64 位登录 token + userid 才算真凭据，避免 36/40 位的 qimei 误触发
+    if (KGAppToken.length != 64 || KGAppUid.length == 0) { return; }
+    KGObservedToken = YES;
+    KGSaveCreds(KGAppToken, KGAppUid);
+    KGWriteDiag([NSString stringWithFormat:@"v15 命中真实token len=%lu uid=%@ mid=%@ dfid=%@ appid=%@",
+                 (unsigned long)KGAppToken.length, KGAppUid, KGAppMid, KGAppDfid, KGAppAppid]);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ KGDoClaim(); });
 }
 
 static void KGInstallHooksOnce(void) {
@@ -1355,8 +1394,11 @@ static void KGInstallHooksOnce(void) {
                 id r = KGOrigReqURL ? ((id(*)(id, SEL))KGOrigReqURL)(self, s) : nil;
                 @try {
                     if ([r isKindOfClass:NSURL.class]) {
+                        NSString *u = [(NSURL *)r absoluteString];
+                        BOOL ours = (objc_getAssociatedObject(self, &kKGOurReqKey) != nil);
+                        if (!ours) { KGRawCapture(u); }
                         static int budget = 0;
-                        if (budget < 6000) { budget++; KGOnURLSeen([(NSURL *)r absoluteString]); }
+                        if (budget < 6000) { budget++; KGOnURLSeen(u); }
                     }
                 } @catch (__unused NSException *ex) {}
                 return r;
