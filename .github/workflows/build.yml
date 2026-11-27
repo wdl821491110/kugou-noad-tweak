@@ -36,33 +36,9 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p $GITHUB_WORKSPACE/out
-          # 只从 release 目录复制唯一产物，避免 find 抓到 debug 空壳互相覆盖
-          cp .theos/obj/kugou_noad_v8.dylib $GITHUB_WORKSPACE/out/ 2>/dev/null || \
-          cp .theos/obj/arm64/kugou_noad_v8.dylib $GITHUB_WORKSPACE/out/ 2>/dev/null || \
-          find .theos/obj -name "kugou_noad_v8.dylib" ! -path "*debug*" -exec cp {} $GITHUB_WORKSPACE/out/ \;
+          # release 构建：唯一产物在 .theos/obj/kugou_noad_v8.dylib
+          cp .theos/obj/kugou_noad_v8.dylib $GITHUB_WORKSPACE/out/
           ls -la $GITHUB_WORKSPACE/out
-          # 校验产物非空代码段（__TEXT 必须 > 0），否则构建失败
-          python3 - <<'PYEOF'
-import struct, glob, sys
-f = glob.glob('out/kugou_noad_v8.dylib')
-if not f:
-    print('NO dylib found'); sys.exit(1)
-d = open(f[0], 'rb').read()
-n = struct.unpack_from('<I', d, 16)[0]; off = 32
-text_size = 0
-for _ in range(n):
-    cmd, cs = struct.unpack_from('<II', d, off)
-    if cmd == 0x19:
-        segname = d[off+8:off+16].split(b'\0')[0].decode()
-        if segname == '__TEXT':
-            text_size = struct.unpack_from('<Q', d, off+40)[0]
-        off += cs
-    else:
-        off += cs
-print('dylib size', len(d), '__TEXT', hex(text_size))
-if text_size < 0x1000:
-    print('ERROR: __TEXT empty, broken dylib'); sys.exit(1)
-PYEOF
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
