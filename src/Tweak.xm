@@ -14,6 +14,8 @@
  *    真实显示方法；避开带 complete block 的方法防止回调不触发卡流程。
  *  - v6-D：精简臃肿功能入口（直播/K歌/游戏/商城），只拦纯跳转方法，
  *    不隐藏 view（防依赖崩溃）、不碰内购（防 VIP 买不了）、不碰带 block 的。
+ *  - v7：我的页赚钱（任务中心）+ 首页轮播图。轮播图连数据源一起拦，
+ *    数据源用空数组而非 nil，避免下游遍历崩溃。
  */
 
 @import Foundation;
@@ -38,6 +40,10 @@ static void KGCallCB(id cb) {
 /* 通用空实现：void 返回 / id 返回 */
 static void KGNoop(id self, SEL _cmd, ...) { }
 static id KGNoopNil(id self, SEL _cmd, ...) { return nil; }
+
+/* 返回空容器：比 nil 安全，避免下游直接遍历/取 count 崩溃 */
+static id KGNoopEmptyArray(id self, SEL _cmd, ...) { return @[]; }
+static id KGNoopEmptyDict(id self, SEL _cmd, ...) { return @{}; }
 
 /* 需要给回调传 nil，否则业务流程卡住 */
 static void KGNoop_CB2(id self, SEL _cmd, id success, id error) { KGCallCB(success); }
@@ -202,6 +208,27 @@ static KGSelHook kSelHooks[] = {
     {"p_ktvEnterButtonClicked:", (IMP)KGNoopNil},
     {"enterStoreType:", (IMP)KGNoopNil},
     {"jumpThemeStorePage", (IMP)KGNoopNil},
+
+    /* v7: 我的页「赚钱」= 任务中心（TaskCenter）入口。
+     * 拦跳转 + 入口数据/显示判定；canShow* 用 KGNoopNil 返回 NO。 */
+    {"goToTaskCenter", (IMP)KGNoopNil},
+    {"goToTaskCenterWithSourceId:", (IMP)KGNoopNil},
+    {"jumpToTaskCenter", (IMP)KGNoopNil},
+    {"gotoTaskCenterView", (IMP)KGNoopNil},
+    {"clickOpenTaskCenter", (IMP)KGNoopNil},
+    {"requestTaskCenterEntrance", (IMP)KGNoopNil},
+    {"canShowTaskCenter", (IMP)KGNoopNil},
+    {"canShowDailyTaskCenter", (IMP)KGNoopNil},
+
+    /* v7: 首页轮播图。之前只拦 request（走缓存绕过），这次连数据源+渲染一起拦。
+     * 数据源方法返回空数组而非 nil，避免下游遍历崩溃。 */
+    {"getCacheBannerInfoFroShow", (IMP)KGNoopEmptyArray},
+    {"filterCanShowHomeBannerItem:", (IMP)KGNoopEmptyArray},
+    {"refreshWithBanners:", (IMP)KGNoopNil},
+    {"reloadBannerData", (IMP)KGNoopNil},
+    {"showBannerByDiffCategory", (IMP)KGNoopNil},
+    {"setupSliderBannerAdSubviews:", (IMP)KGNoopNil},
+    {"refreshRecommendBannerFromRequestResponse:", (IMP)KGNoopNil},
 };
 static const NSUInteger kSelHookCount = sizeof(kSelHooks) / sizeof(kSelHooks[0]);
 
