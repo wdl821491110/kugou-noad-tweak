@@ -7,6 +7,8 @@
  *  - 每个 hook 点可用宏 KG_DEBUG 打开日志。
  */
 
+@import Foundation;
+
 #define KG_DEBUG 0
 #if KG_DEBUG
 #define KGLog(...) NSLog(@"[KGNoAd] " __VA_ARGS__)
