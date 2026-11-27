@@ -36,7 +36,7 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p $GITHUB_WORKSPACE/out
-          find $GITHUB_WORKSPACE -name "kugou_noad.dylib" -exec cp {} $GITHUB_WORKSPACE/out/ \;
+          find $GITHUB_WORKSPACE -name "kugou_noad_v8.dylib" -exec cp {} $GITHUB_WORKSPACE/out/ \;
           cp packages/*.deb $GITHUB_WORKSPACE/out/ 2>/dev/null || true
           ls -la $GITHUB_WORKSPACE/out
 

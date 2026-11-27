@@ -17,6 +17,13 @@
  *  - v7：我的页赚钱（任务中心）+ 首页轮播图 + 首页运营卡片位
  *    （概念实验室/盲盒/VIP推荐/小众宝藏等）。数据源用空数组而非 nil 防崩；
  *    不碰首页推荐主接口 requestRecSortFirstPageData，保住正常歌曲流。
+ *  - v8：v7 三处都没生效，修正方向：
+ *     * 产物改名 kugou_noad_v8.dylib，避免 LC 里版本混淆。
+ *     * 轮播图：补拦缓存读取链路 getCacheBannerInfo / readBannerInfoFromLocalPlist
+ *       / refreshBannerList: 等（v7 只拦了 FroShow 变体）。
+ *     * 赚钱入口：补拦 needRefreshTaskCenterEntrance 等数据判定。
+ *     * 6 卡片：不再拦 banner 数据源（走的是推荐流原生 cell），改为运行时
+ *       按类名 hook 这些 cell 的 layoutSubviews 隐藏自身。
  */
 
 @import Foundation;
@@ -33,6 +40,66 @@
 #endif
 
 typedef void (^KGSuccessCB)(id);
+
+/* ============ v8: 首页 6 个运营卡片 cell 运行时隐藏 ============
+ * 这些卡片是首页推荐流里的原生 UICollectionViewCell，不走 banner 数据源。
+ * 静态解析拿不到它们的 method list，改为运行时按类名拿到类，
+ * 替换 layoutSubviews：隐藏自身，让卡片视觉消失。不调用原实现 =
+ * 内部 subview 不再布局渲染，但 cell 仍占位（不会崩，这是最安全档位）。 */
+static void KGHiddenLayout(id self, SEL _cmd) {
+    UIView *v = (UIView *)self;
+    if (v.hidden != YES) { v.hidden = YES; }
+    if (v.alpha != 0.0) { v.alpha = 0.0; }
+}
+
+static void KGInstallCardCellHooks(void) {
+    /* 概念实验室 / 曲风盲盒 / VIP专属推荐 / 小众宝藏 / 喜欢 ta 特喜欢 / 概念er新推 */
+    static const char *names[] = {
+        "KGYouthNewDiscoverConceptLabV5Cell",
+        "KGYouthNewDiscoverNicheRecV5Cell",
+        "KGYouthNewDiscoverVipRecV5Cell",
+        "KGYouthNewDiscoverDifTagRecV5Cell",
+        "KGYouthNewDiscoverCardAdV5View",
+        "KGYouthNewDiscoverCardAdView",
+        "YouthNewDiscoverConceptLabItemBaseCell",
+        "YouthNewDiscoverDifTagRecItemBaseCell",
+        NULL
+    };
+    static BOOL installed[16] = { NO };
+    SEL layoutSel = @selector(layoutSubviews);
+
+    /* 不用 dispatch_once：cell 类可能启动晚期才注册，每次 tick 重试未装上的 */
+    for (int i = 0; names[i] && i < 16; i++) {
+        if (installed[i]) { continue; }
+        Class cls = objc_getClass(names[i]);
+        if (!cls) { continue; }   // 还没注册，下次再试
+
+        /* 关键：绝不能用 class_getInstanceMethod，它会沿继承链拿到父类
+         * (UICollectionViewCell) 的 layoutSubviews，替换后会隐藏所有 cell。
+         * 先 class_addMethod 给本类加自己的实现（不碰父类）；
+         * 若本类已有自己的实现（add 失败），再只在本类 method list 内替换。 */
+        BOOL added = class_addMethod(cls, layoutSel, (IMP)KGHiddenLayout, "v@:");
+        if (added) {
+            installed[i] = YES;
+            KGLogAlways(@"added hidden layout to: %s", names[i]);
+        } else {
+            unsigned int mc = 0;
+            Method *mlist = class_copyMethodList(cls, &mc);
+            BOOL done = NO;
+            for (unsigned int k = 0; k < mc; k++) {
+                if (sel_isEqual(method_getName(mlist[k]), layoutSel)) {
+                    method_setImplementation(mlist[k], (IMP)KGHiddenLayout);
+                    installed[i] = YES;
+                    KGLogAlways(@"replaced own layout on: %s", names[i]);
+                    done = YES;
+                    break;
+                }
+            }
+            free(mlist);
+            if (!done) { KGLogAlways(@"cannot hook layout on: %s", names[i]); }
+        }
+    }
+}
 
 static void KGCallCB(id cb) {
     if (cb) { ((KGSuccessCB)cb)(nil); }
@@ -242,6 +309,20 @@ static KGSelHook kSelHooks[] = {
     {"requestBannerBackupForHomeWithError:", (IMP)KGNoopNil},
     {"requestBannerBackupForHomeWithSuccessBlock:failBlock:", (IMP)KGNoopNil},
     {"requestHomeTextAd", (IMP)KGNoopNil},
+
+    /* v8: 轮播图缓存读取链路（v7 只拦了 FroShow 变体，实际还走这几个） */
+    {"getCacheBannerInfo", (IMP)KGNoopEmptyArray},
+    {"readBannerInfoFromLocalPlist", (IMP)KGNoopNil},
+    {"refreshBannerList:", (IMP)KGNoopNil},
+    {"updateBannerList", (IMP)KGNoopNil},
+    {"setBannerInfoArray:", (IMP)KGNoop},
+    {"setArrBannerList:", (IMP)KGNoop},
+    {"setBannerInfos:", (IMP)KGNoop},
+
+    /* v8: 我的页「赚钱」入口数据判定（v7 只拦 canShow，入口由这些驱动） */
+    {"needRefreshTaskCenterEntrance", (IMP)KGNoopNil},
+    {"mineTaskCenterReadPointShow", (IMP)KGNoopNil},
+    {"checkCanShowMyPageTaskCenterSignIn", (IMP)KGNoopNil},
 };
 static const NSUInteger kSelHookCount = sizeof(kSelHooks) / sizeof(kSelHooks[0]);
 
@@ -291,6 +372,9 @@ static void KGInstallAllHooks(void) {
 
     /* A+C：弹窗调度层全局 selector 挂载 */
     KGInstallSelectorHooks();
+
+    /* v8：首页 6 个运营卡片 cell 运行时隐藏 */
+    KGInstallCardCellHooks();
 }
 
 %ctor {
